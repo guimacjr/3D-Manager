@@ -38,6 +38,7 @@ Servidor padrao: `http://localhost:3333`
 
 ## Notas de calculo no POST /quotes
 - Recebe `units_produced` (default 1)
+- `filament_items` e `extra_costs` sao considerados como custos do lote informado no formulario.
 - Persiste no `print_quotes` os valores **unitarios**:
   - `subtotal_cost_cents`
   - `tax_cost_cents`

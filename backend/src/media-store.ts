@@ -35,6 +35,19 @@ function toAbsolutePath(filePathOrUri: string): string {
   return path.isAbsolute(parsed) ? parsed : path.resolve(process.cwd(), parsed);
 }
 
+function normalizeSeparators(input: string): string {
+  return input.replace(/\\/g, "/");
+}
+
+function extractStorageRelativePath(input: string): string | null {
+  const normalized = normalizeSeparators(fileUriToPath(input)).replace(/^\.\/+/, "");
+  const prefix = "storage/media/";
+  if (!normalized.startsWith(prefix)) {
+    return null;
+  }
+  return normalized.slice(prefix.length);
+}
+
 function sanitizeFileName(fileName: string): string {
   const base = path.basename(fileName).trim();
   const normalized = base.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_");
@@ -59,12 +72,21 @@ export function persistMediaFile(params: {
 }) {
   const { mediaRoot, mediaType, localUri, backendRoot, ownerType, ownerId } = params;
 
-  if (localUri.startsWith("storage/media/")) {
-    const absolute = path.join(backendRoot, localUri);
-    if (fs.existsSync(absolute)) {
+  const storageRelativePath = extractStorageRelativePath(localUri);
+  if (storageRelativePath) {
+    const mediaAbsolute = path.join(mediaRoot, storageRelativePath);
+    if (fs.existsSync(mediaAbsolute)) {
       return {
-        relativePath: localUri,
-        absolutePath: absolute,
+        relativePath: path.posix.join("storage", "media", normalizeSeparators(storageRelativePath)),
+        absolutePath: mediaAbsolute,
+      };
+    }
+
+    const backendMediaAbsolute = path.join(backendRoot, "storage", "media", storageRelativePath);
+    if (fs.existsSync(backendMediaAbsolute)) {
+      return {
+        relativePath: path.posix.join("storage", "media", normalizeSeparators(storageRelativePath)),
+        absolutePath: backendMediaAbsolute,
       };
     }
   }

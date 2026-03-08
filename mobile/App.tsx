@@ -399,7 +399,7 @@ function computeQuoteDisplayTotals({
   const paybackTotalCents = Math.round(paybackPerHourCents * (totalPrintTimeMin / 60));
   const laborTotalCents = Math.round((totalPostProcessingMin / 60) * laborHourCostCents);
 
-  const filamentUnitTotalCents = quote.filamentUsages.reduce((sum, line) => {
+  const filamentBatchTotalCents = quote.filamentUsages.reduce((sum, line) => {
     const filament = filaments.find((item) => item.name === line.filamentName);
     const unitCostPerGramCents = filament
       ? filament.purchaseCostCents / filament.purchasedWeightGrams
@@ -408,12 +408,12 @@ function computeQuoteDisplayTotals({
     return sum + lineTotalCents;
   }, 0);
 
-  const extrasUnitTotalCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasBatchTotalCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
   const packagingBatchTotalCents = quote.packagingCostCents * unitsProduced;
 
   const subtotalBatchCents =
-    filamentUnitTotalCents * unitsProduced +
-    extrasUnitTotalCents * unitsProduced +
+    filamentBatchTotalCents +
+    extrasBatchTotalCents +
     packagingBatchTotalCents +
     energyTotalCents +
     paybackTotalCents +
@@ -1000,6 +1000,12 @@ function QuoteViewScreen({
   markupPercent: number;
   onBack: () => void;
 }) {
+  const [isDescriptionOpen, setIsDescriptionOpen] = useState(false);
+
+  useEffect(() => {
+    setIsDescriptionOpen(false);
+  }, [quote?.id]);
+
   if (!quote) {
     return (
       <ScrollView contentContainerStyle={styles.content}>
@@ -1039,14 +1045,16 @@ function QuoteViewScreen({
       ...line,
       unitCostPerGramCents,
       lineTotalCents,
-      batchTotalCents: lineTotalCents * unitsProduced,
+      batchTotalCents: lineTotalCents,
     };
   });
 
-  const filamentUnitTotalCents = filamentLines.reduce((sum, line) => sum + line.lineTotalCents, 0);
+  const filamentUnitTotalCents = Math.round(
+    filamentLines.reduce((sum, line) => sum + line.lineTotalCents, 0) / unitsProduced
+  );
   const filamentBatchTotalCents = filamentLines.reduce((sum, line) => sum + line.batchTotalCents, 0);
-  const extrasUnitTotalCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
-  const extrasBatchTotalCents = extrasUnitTotalCents * unitsProduced;
+  const extrasBatchTotalCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasUnitTotalCents = Math.round(extrasBatchTotalCents / unitsProduced);
   const packagingBatchTotalCents = quote.packagingCostCents * unitsProduced;
 
   const totals = computeQuoteDisplayTotals({
@@ -1073,6 +1081,16 @@ function QuoteViewScreen({
         <Text style={styles.cardTitle}>{quote.name}</Text>
         <Text style={styles.text}>Impressora: {printer ? `${printer.name} (${printer.model})` : "Nao definida"}</Text>
         <Text style={styles.text}>Unidades produzidas: {unitsProduced}</Text>
+      </View>
+      <View style={styles.card}>
+        <Pressable style={styles.selectTrigger} onPress={() => setIsDescriptionOpen((prev) => !prev)}>
+          <Text style={styles.selectValueText}>
+            {isDescriptionOpen ? "Ocultar descrição" : "Ver descrição"}
+          </Text>
+        </Pressable>
+        {isDescriptionOpen ? (
+          <Text style={styles.text}>{quote.description?.trim() ? quote.description : "Sem descrição."}</Text>
+        ) : null}
       </View>
 
       <View style={styles.card}>
@@ -1101,16 +1119,16 @@ function QuoteViewScreen({
       </View>
 
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Filamentos (por item)</Text>
+        <Text style={styles.cardTitle}>Filamentos (lote)</Text>
         {filamentLines.length === 0 && <Text style={styles.text}>Sem filamentos informados.</Text>}
         {filamentLines.map((line) => (
           <Text key={line.id} style={styles.text}>
             - {line.filamentName}: {line.usedWeightGrams}g x {money(Math.round(line.unitCostPerGramCents))}/g ={" "}
-            {money(line.lineTotalCents)} por unidade | {money(line.batchTotalCents)} no lote
+            {money(line.lineTotalCents)} no lote | {money(Math.round(line.lineTotalCents / unitsProduced))} por unidade
           </Text>
         ))}
-        <Text style={styles.text}>Total filamentos: {money(filamentUnitTotalCents)} por unidade</Text>
         <Text style={styles.text}>Total filamentos no lote: {money(filamentBatchTotalCents)}</Text>
+        <Text style={styles.text}>Total filamentos por unidade: {money(filamentUnitTotalCents)}</Text>
       </View>
 
       <View style={styles.card}>
@@ -1135,8 +1153,8 @@ function QuoteViewScreen({
             - {item.itemName}: {money(item.itemCostCents)}
           </Text>
         ))}
-        <Text style={styles.text}>Total extras: {money(extrasUnitTotalCents)} por unidade</Text>
         <Text style={styles.text}>Total extras no lote: {money(extrasBatchTotalCents)}</Text>
+        <Text style={styles.text}>Total extras por unidade: {money(extrasUnitTotalCents)}</Text>
       </View>
 
       <View style={styles.card}>
@@ -1199,6 +1217,7 @@ function QuoteFormScreen({
   const [extraCost, setExtraCost] = useState("");
   const [extraList, setExtraList] = useState<QuoteExtraCost[]>(initialData?.extraCosts ?? []);
   const [editingExtraId, setEditingExtraId] = useState<string | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
 
   useEffect(() => {
     setQuoteDraftId(initialData?.id ?? createId("quote"));
@@ -1222,6 +1241,7 @@ function QuoteFormScreen({
     setFilamentWeight("");
     setExtraName("");
     setExtraCost("");
+    setFormError(null);
   }, [initialData, filaments, printers]);
 
   const addMediaFromPicker = async (type: "photo" | "video" | "3mf") => {
@@ -1239,15 +1259,20 @@ function QuoteFormScreen({
     const files = await pickFilesOnWeb(accept, true);
     if (!files.length) return;
 
-    for (const file of files) {
-      const uploaded = await uploadMediaFile(file, type, quoteDraftId);
-      if (type === "3mf") {
-        setMedia3mfList((prev) => [...prev, uploaded.local_uri]);
-      } else if (type === "photo") {
-        setMediaPhotos((prev) => [...prev, uploaded.local_uri]);
-      } else {
-        setMediaVideos((prev) => [...prev, uploaded.local_uri]);
+    setFormError(null);
+    try {
+      for (const file of files) {
+        const uploaded = await uploadMediaFile(file, type, quoteDraftId);
+        if (type === "3mf") {
+          setMedia3mfList((prev) => [...prev, uploaded.local_uri]);
+        } else if (type === "photo") {
+          setMediaPhotos((prev) => [...prev, uploaded.local_uri]);
+        } else {
+          setMediaVideos((prev) => [...prev, uploaded.local_uri]);
+        }
       }
+    } catch (error: any) {
+      setFormError(error?.message ?? "Falha ao enviar mídia.");
     }
   };
 
@@ -1356,7 +1381,8 @@ function QuoteFormScreen({
   const handleSave = () => {
     const parsedPrintTime = parseLocaleNumber(printTime);
     const parsedPostTime = parseLocaleNumber(postTime);
-    const parsedPackaging = Math.round(parseLocaleNumber(packagingCost) * 100);
+    const parsedPackagingValue = packagingCost.trim() === "" ? 0 : parseLocaleNumber(packagingCost);
+    const parsedPackaging = Math.round(parsedPackagingValue * 100);
     const parsedUnitsProduced = Math.max(1, Math.round(parseLocaleNumber(unitsProduced) || 1));
 
     if (
@@ -1364,13 +1390,17 @@ function QuoteFormScreen({
       !Number.isFinite(parsedPrintTime) ||
       !Number.isFinite(parsedPostTime) ||
       !Number.isFinite(parsedPackaging) ||
-      !selectedPrinterId,
+      !selectedPrinterId ||
       parsedPrintTime < 0 ||
       parsedPostTime < 0 ||
       parsedPackaging < 0
     ) {
+      setFormError(
+        "Preencha nome, impressora, tempos válidos e custo de embalagem válido (use 0 se não houver)."
+      );
       return;
     }
+    setFormError(null);
 
     const filamentCost = filamentList.reduce((sum, line) => sum + line.usedWeightGrams * 2, 0);
     const extraCostCents = extraList.reduce((sum, item) => sum + item.itemCostCents, 0);
@@ -1571,6 +1601,7 @@ function QuoteFormScreen({
         onChangeText={setPackagingCost}
         keyboardType="numeric"
       />
+      {formError ? <Text style={styles.errorText}>{formError}</Text> : null}
 
       <View style={styles.row}>
         <Pressable style={styles.primaryButtonFixed} onPress={handleSave}>
@@ -1810,6 +1841,16 @@ export default function MockupApp() {
         <NavButton label="Orçamentos" active={screen === "quotes"} onPress={() => setScreen("quotes")} />
         </View>
       </View>
+      {isSyncing ? (
+        <View style={styles.statusBanner}>
+          <Text style={styles.statusText}>Sincronizando dados...</Text>
+        </View>
+      ) : null}
+      {syncError ? (
+        <View style={styles.errorBanner}>
+          <Text style={styles.errorText}>{syncError}</Text>
+        </View>
+      ) : null}
 
       {screen === "dashboard" && <DashboardScreen goTo={setScreen} />}
 
@@ -2076,6 +2117,7 @@ export default function MockupApp() {
           onSave={(quote) => {
             void (async () => {
               try {
+                setSyncError(null);
                 if (!activeCostSettingId) {
                   throw new Error("Defina e salve os custos antes de criar orçamentos.");
                 }
@@ -2232,6 +2274,38 @@ const styles = StyleSheet.create({
   text: {
     fontSize: 13,
     color: "#334260",
+  },
+  statusBanner: {
+    marginHorizontal: 16,
+    marginTop: 12,
+    marginBottom: 4,
+    backgroundColor: "#e0f2fe",
+    borderWidth: 1,
+    borderColor: "#7dd3fc",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  statusText: {
+    color: "#075985",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  errorBanner: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 4,
+    backgroundColor: "#fef2f2",
+    borderWidth: 1,
+    borderColor: "#fca5a5",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  errorText: {
+    color: "#b91c1c",
+    fontSize: 13,
+    fontWeight: "600",
   },
   fieldWrap: {
     gap: 6,

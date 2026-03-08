@@ -50,8 +50,9 @@ export function computeQuote(input: QuoteComputationInput): QuoteComputationResu
   // Mao de obra considera apenas tempo humano (pos-processamento).
   const laborBatchCents = Math.round((totalPostMinutes / 60) * input.laborHourCostCents);
 
-  const filamentBatchCents = input.filamentTotalUnitCents * units;
-  const extrasBatchCents = input.extrasTotalUnitCents * units;
+  // Filamentos e extras recebidos no formulario sao custos totais do lote.
+  const filamentBatchCents = input.filamentTotalUnitCents;
+  const extrasBatchCents = input.extrasTotalUnitCents;
   const packagingBatchCents = input.packagingCostCents * units;
 
   const subtotalBatchCents =
