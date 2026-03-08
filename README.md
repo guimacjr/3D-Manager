@@ -182,7 +182,3 @@ Fluxo sugerido:
    - o que mudou
    - como testar
 
-## Licenca
-
-Defina a licenca antes de publicar (ex.: MIT).
-Se quiser, eu posso gerar o arquivo `LICENSE` para voce.
