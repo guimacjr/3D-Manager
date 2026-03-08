@@ -505,6 +505,7 @@ function SelectField({
   value,
   placeholder,
   options,
+  emptyText,
   isOpen,
   onToggle,
   onSelect,
@@ -513,6 +514,7 @@ function SelectField({
   value: string;
   placeholder: string;
   options: string[];
+  emptyText?: string;
   isOpen: boolean;
   onToggle: () => void;
   onSelect: (value: string) => void;
@@ -527,7 +529,7 @@ function SelectField({
       </Pressable>
       {isOpen && (
         <View style={styles.selectMenu}>
-          {options.length === 0 && <Text style={styles.text}>Nenhum filamento cadastrado.</Text>}
+          {options.length === 0 && <Text style={styles.text}>{emptyText ?? "Nenhum item cadastrado."}</Text>}
           {options.map((option) => (
             <Pressable
               key={option}
@@ -1174,6 +1176,8 @@ function QuoteFormScreen({
   const [name, setName] = useState(initialData?.name ?? "");
   const [quoteDraftId, setQuoteDraftId] = useState(initialData?.id ?? createId("quote"));
   const [description, setDescription] = useState(initialData?.description ?? "");
+  const [selectedPrinterId, setSelectedPrinterId] = useState(initialData?.printerId ?? printers[0]?.id ?? "");
+  const [isPrinterDropdownOpen, setIsPrinterDropdownOpen] = useState(false);
   const [unitsProduced, setUnitsProduced] = useState(String(initialData?.unitsProduced ?? 1));
   const [printTime, setPrintTime] = useState(initialData ? String(initialData.printTimeMin) : "");
   const [postTime, setPostTime] = useState(initialData ? String(initialData.postProcessingMin) : "");
@@ -1200,6 +1204,8 @@ function QuoteFormScreen({
     setQuoteDraftId(initialData?.id ?? createId("quote"));
     setName(initialData?.name ?? "");
     setDescription(initialData?.description ?? "");
+    setSelectedPrinterId(initialData?.printerId ?? printers[0]?.id ?? "");
+    setIsPrinterDropdownOpen(false);
     setUnitsProduced(String(initialData?.unitsProduced ?? 1));
     setPrintTime(initialData ? String(initialData.printTimeMin) : "");
     setPostTime(initialData ? String(initialData.postProcessingMin) : "");
@@ -1216,7 +1222,7 @@ function QuoteFormScreen({
     setFilamentWeight("");
     setExtraName("");
     setExtraCost("");
-  }, [initialData, filaments]);
+  }, [initialData, filaments, printers]);
 
   const addMediaFromPicker = async (type: "photo" | "video" | "3mf") => {
     if (Platform.OS !== "web") {
@@ -1358,6 +1364,7 @@ function QuoteFormScreen({
       !Number.isFinite(parsedPrintTime) ||
       !Number.isFinite(parsedPostTime) ||
       !Number.isFinite(parsedPackaging) ||
+      !selectedPrinterId,
       parsedPrintTime < 0 ||
       parsedPostTime < 0 ||
       parsedPackaging < 0
@@ -1373,7 +1380,7 @@ function QuoteFormScreen({
 
     onSave({
       id: quoteDraftId,
-      printerId: initialData?.printerId ?? printers[0]?.id,
+      printerId: selectedPrinterId,
       name: name.trim(),
       description: description.trim(),
       unitsProduced: parsedUnitsProduced,
@@ -1397,6 +1404,21 @@ function QuoteFormScreen({
 
       <Field label="Nome do objeto" value={name} onChangeText={setName} />
       <Field label="Descrição" value={description} onChangeText={setDescription} multiline />
+      <SelectField
+        label="Impressora"
+        value={printers.find((item) => item.id === selectedPrinterId)?.name ?? ""}
+        placeholder="Selecione uma impressora"
+        options={printers.map((item) => item.name)}
+        emptyText="Nenhuma impressora cadastrada."
+        isOpen={isPrinterDropdownOpen}
+        onToggle={() => setIsPrinterDropdownOpen((prev) => !prev)}
+        onSelect={(printerName) => {
+          const selected = printers.find((item) => item.name === printerName);
+          if (!selected) return;
+          setSelectedPrinterId(selected.id);
+          setIsPrinterDropdownOpen(false);
+        }}
+      />
       <Field
         label="Unidades produzidas"
         value={unitsProduced}
@@ -1448,6 +1470,7 @@ function QuoteFormScreen({
           value={filamentName}
           placeholder="Selecione um filamento"
           options={filaments.map((item) => item.name)}
+          emptyText="Nenhum filamento cadastrado."
           isOpen={isFilamentDropdownOpen}
           onToggle={() => setIsFilamentDropdownOpen((prev) => !prev)}
           onSelect={(value) => {
