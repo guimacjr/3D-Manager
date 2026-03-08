@@ -1,0 +1,48 @@
+{
+  "name": "3d-manager-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "dev": "electron .",
+    "dist:win": "electron-builder --win portable --config.win.signAndEditExecutable=false"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.ger3d.manager",
+    "productName": "3D Manager",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "backend-runner.cjs"
+    ],
+    "extraResources": [
+      {
+        "from": "../release/windows/mobile-web",
+        "to": "app/mobile-web"
+      },
+      {
+        "from": "../release/windows/backend",
+        "to": "app/backend"
+      },
+      {
+        "from": "../release/windows/data",
+        "to": "app/data"
+      },
+      {
+        "from": "../release/windows/storage",
+        "to": "app/storage"
+      }
+    ],
+    "win": {
+      "target": [
+        "portable"
+      ]
+    }
+  }
+}

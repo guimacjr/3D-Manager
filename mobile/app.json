@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "3D Manager",
+    "slug": "3d-manager",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {},
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    }
+  }
+}

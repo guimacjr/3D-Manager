@@ -1,0 +1,18 @@
+node_modules/
+**/node_modules/
+
+# build / release artifacts
+dist/
+**/dist/
+release/
+**/release/
+
+# local runtime data
+storage/
+**/storage/
+*.sqlite
+*.db
+
+# logs and temp files
+*.log
+*.tmp

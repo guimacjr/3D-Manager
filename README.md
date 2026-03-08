@@ -1,0 +1,188 @@
+# 3D Manager
+
+Projeto open source para gerenciar uma farm de impressoras 3D com abordagem local-first.
+
+Status atual: modulo de **precificacao e orcamento** em desenvolvimento ativo, com backend local, app React Native (Expo/Web) e build desktop portable para Windows.
+
+## Objetivo
+
+O foco do MVP e permitir:
+
+- Cadastro de impressoras.
+- Cadastro de filamentos.
+- Configuracao de custos fixos.
+- Criacao e gestao de orcamentos.
+- Upload e download de midias relacionadas ao orcamento (`photo`, `video`, `3mf`).
+
+## Arquitetura
+
+- `mobile/`: app React Native (Expo + TypeScript).
+- `backend/`: API local (Fastify + TypeScript + SQLite).
+- `desktop/`: empacotamento desktop (Electron) para `.exe` portable no Windows.
+- `mockups/`: mockups de navegacao/estrutura de telas.
+
+Banco de dados:
+
+- SQLite local.
+- Migracoes versionadas em `backend/migrations`.
+
+## Funcionalidades implementadas
+
+- CRUD de impressoras (`soft delete`).
+- CRUD de filamentos (`soft delete`, recalc de custo por grama/kg).
+- Gestao de custos fixos com vigencia ativa.
+- Orcamentos:
+  - listar
+  - criar
+  - editar
+  - visualizar detalhes
+  - excluir
+- Calculo de orcamento no backend (energia, payback, mao de obra, filamentos, extras, embalagem, imposto e markup).
+- Midias por orcamento:
+  - upload com `quote_id`
+  - persistencia local por pasta do orcamento
+  - download na tela de visualizacao
+
+## Estrutura de midias
+
+Arquivos sao salvos por orcamento, preservando nome original:
+
+- `storage/media/quotes/<quote_id>/photos/<arquivo>`
+- `storage/media/quotes/<quote_id>/videos/<arquivo>`
+- `storage/media/quotes/<quote_id>/models/<arquivo>`
+
+Observacao: se ja existir arquivo com mesmo nome no mesmo orcamento/tipo, o backend retorna erro (nao renomeia automaticamente).
+
+## Requisitos
+
+- Node.js 20+ (recomendado)
+- npm 10+ (recomendado)
+- Windows para build desktop `.exe` portable
+
+## Rodando em desenvolvimento
+
+## 1) Backend
+
+```bash
+cd backend
+npm install
+npm run dev
+```
+
+API padrao: `http://localhost:3333`
+
+## 2) Mobile (Expo Web)
+
+Em outro terminal:
+
+```bash
+cd mobile
+npm install
+npx expo start --web
+```
+
+Se quiser apontar para outra URL da API:
+
+```bash
+EXPO_PUBLIC_API_URL=http://localhost:3333 npx expo start --web
+```
+
+## API principal
+
+- `GET /health`
+- `POST /uploads`
+- `GET /printers`
+- `POST /printers`
+- `PUT /printers/:id`
+- `DELETE /printers/:id`
+- `GET /filaments`
+- `POST /filaments`
+- `PUT /filaments/:id`
+- `DELETE /filaments/:id`
+- `GET /cost-settings`
+- `GET /cost-settings/active`
+- `POST /cost-settings`
+- `GET /quotes`
+- `GET /quotes/:id`
+- `GET /quotes/:id/media`
+- `POST /quotes`
+- `PUT /quotes/:id`
+- `DELETE /quotes/:id`
+- `GET /storage/media/*` (download de arquivo salvo)
+
+## Build desktop portable (`.exe`) - Windows
+
+Na raiz do projeto:
+
+```powershell
+scripts\build-exe-windows.cmd
+```
+
+ou:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-exe-windows.ps1
+```
+
+Saida esperada:
+
+- executavel portable em `desktop/dist`
+
+Comportamento portable:
+
+- Nao usa `%AppData%` para banco/midias do sistema.
+- Dados de runtime ficam ao lado do executavel em:
+  - `3d-manager-data/data/app.sqlite`
+  - `3d-manager-data/storage/media`
+
+## Banco de teste vs producao
+
+O pipeline de build desktop nao empacota o banco de teste `backend/data.sqlite`.
+No modo portable, o banco de uso real e criado em `3d-manager-data/data/app.sqlite` na primeira execucao.
+
+## Estrutura do repositorio
+
+```text
+.
+|-- AGENTS.md
+|-- backend/
+|   |-- migrations/
+|   |-- src/
+|   `-- README.md
+|-- mobile/
+|   |-- src/
+|   |-- App.tsx
+|   `-- README.md
+|-- desktop/
+|   |-- main.js
+|   |-- backend-runner.cjs
+|   `-- README.md
+|-- mockups/
+`-- scripts/
+```
+
+## Roadmap (alto nivel)
+
+- Modulo de fila de impressao.
+- Monitoramento de producao.
+- Controle de estoque.
+- Financeiro consolidado.
+- Sincronizacao multiusuario opcional.
+
+## Contribuindo
+
+Contribuicoes sao bem-vindas.
+
+Fluxo sugerido:
+
+1. Abra uma issue descrevendo o problema/feature.
+2. Crie um branch com escopo pequeno e objetivo.
+3. Envie PR com:
+   - contexto
+   - o que mudou
+   - como testar
+
+## Licenca
+
+Defina a licenca antes de publicar (ex.: MIT).
+Se quiser, eu posso gerar o arquivo `LICENSE` para voce.
