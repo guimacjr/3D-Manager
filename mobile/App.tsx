@@ -418,8 +418,9 @@ function computeQuoteDisplayTotals({
     energyTotalCents +
     paybackTotalCents +
     laborTotalCents;
-  const taxBatchCents = Math.round(subtotalBatchCents * (taxRatePercent / 100));
-  const finalBatchCents = Math.round((subtotalBatchCents + taxBatchCents) * (1 + markupPercent / 100));
+  const withMarkupBatchCents = Math.round(subtotalBatchCents * (1 + markupPercent / 100));
+  const taxBatchCents = Math.round(withMarkupBatchCents * (taxRatePercent / 100));
+  const finalBatchCents = withMarkupBatchCents + taxBatchCents;
 
   return {
     subtotalUnitCents: Math.round(subtotalBatchCents / unitsProduced),
@@ -1001,9 +1002,11 @@ function QuoteViewScreen({
   onBack: () => void;
 }) {
   const [isDescriptionOpen, setIsDescriptionOpen] = useState(false);
+  const [openFormulaKeys, setOpenFormulaKeys] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     setIsDescriptionOpen(false);
+    setOpenFormulaKeys({});
   }, [quote?.id]);
 
   if (!quote) {
@@ -1073,6 +1076,10 @@ function QuoteViewScreen({
     ...quote.mediaPhotos.map((uri) => ({ mediaType: "photo", uri })),
     ...quote.mediaVideos.map((uri) => ({ mediaType: "video", uri })),
   ];
+
+  const toggleFormula = (key: string) => {
+    setOpenFormulaKeys((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
 
   return (
     <ScrollView contentContainerStyle={styles.content}>
@@ -1159,12 +1166,77 @@ function QuoteViewScreen({
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Resumo final</Text>
-        <Text style={styles.text}>Custo final de producao: {money(totals.subtotalUnitCents)} por unidade</Text>
-        <Text style={styles.text}>Custo de imposto: {money(totals.taxUnitCents)} por unidade</Text>
-        <Text style={styles.text}>Valor final com markup: {money(totals.finalUnitCents)} por unidade</Text>
-        <Text style={styles.text}>Total de producao no lote: {money(totals.subtotalBatchCents)}</Text>
-        <Text style={styles.text}>Total de imposto no lote: {money(totals.taxBatchCents)}</Text>
-        <Text style={styles.text}>Total com markup no lote: {money(totals.finalBatchCents)}</Text>
+        <View style={styles.row}>
+          <Text style={styles.text}>Custo final de producao: {money(totals.subtotalUnitCents)} por unidade</Text>
+          <Pressable style={styles.formulaButton} onPress={() => toggleFormula("subtotalUnit")}>
+            <Text style={styles.formulaButtonText}>Fórmula</Text>
+          </Pressable>
+        </View>
+        {openFormulaKeys.subtotalUnit ? (
+          <Text style={styles.formulaText}>
+            subtotal_un = arred(total_lote / unidades) = arred({money(totals.subtotalBatchCents)} / {unitsProduced})
+          </Text>
+        ) : null}
+
+        <View style={styles.row}>
+          <Text style={styles.text}>Custo de imposto: {money(totals.taxUnitCents)} por unidade</Text>
+          <Pressable style={styles.formulaButton} onPress={() => toggleFormula("taxUnit")}>
+            <Text style={styles.formulaButtonText}>Fórmula</Text>
+          </Pressable>
+        </View>
+        {openFormulaKeys.taxUnit ? (
+          <Text style={styles.formulaText}>
+            base_imposto_lote = arred(total_lote x (1 + {markupPercent}%)); imposto_lote = arred(base_imposto_lote x {taxRatePercent}%); imposto_un = arred(imposto_lote / unidades)
+          </Text>
+        ) : null}
+
+        <View style={styles.row}>
+          <Text style={styles.text}>Valor final com markup: {money(totals.finalUnitCents)} por unidade</Text>
+          <Pressable style={styles.formulaButton} onPress={() => toggleFormula("finalUnit")}>
+            <Text style={styles.formulaButtonText}>Fórmula</Text>
+          </Pressable>
+        </View>
+        {openFormulaKeys.finalUnit ? (
+          <Text style={styles.formulaText}>
+            base_imposto_lote = arred(total_lote x (1 + {markupPercent}%)); final_lote = base_imposto_lote + imposto_lote; final_un = arred(final_lote / unidades)
+          </Text>
+        ) : null}
+
+        <View style={styles.row}>
+          <Text style={styles.text}>Total de producao no lote: {money(totals.subtotalBatchCents)}</Text>
+          <Pressable style={styles.formulaButton} onPress={() => toggleFormula("subtotalBatch")}>
+            <Text style={styles.formulaButtonText}>Fórmula</Text>
+          </Pressable>
+        </View>
+        {openFormulaKeys.subtotalBatch ? (
+          <Text style={styles.formulaText}>
+            total_lote = filamentos_lote + extras_lote + embalagem_lote + energia_lote + payback_lote + mao_de_obra_lote
+          </Text>
+        ) : null}
+
+        <View style={styles.row}>
+          <Text style={styles.text}>Total de imposto no lote: {money(totals.taxBatchCents)}</Text>
+          <Pressable style={styles.formulaButton} onPress={() => toggleFormula("taxBatch")}>
+            <Text style={styles.formulaButtonText}>Fórmula</Text>
+          </Pressable>
+        </View>
+        {openFormulaKeys.taxBatch ? (
+          <Text style={styles.formulaText}>
+            base_imposto_lote = arred(total_lote x (1 + {markupPercent}%)); imposto_lote = arred(base_imposto_lote x {taxRatePercent}%)
+          </Text>
+        ) : null}
+
+        <View style={styles.row}>
+          <Text style={styles.text}>Total com markup no lote: {money(totals.finalBatchCents)}</Text>
+          <Pressable style={styles.formulaButton} onPress={() => toggleFormula("finalBatch")}>
+            <Text style={styles.formulaButtonText}>Fórmula</Text>
+          </Pressable>
+        </View>
+        {openFormulaKeys.finalBatch ? (
+          <Text style={styles.formulaText}>
+            base_imposto_lote = arred(total_lote x (1 + {markupPercent}%)); final_lote = base_imposto_lote + imposto_lote
+          </Text>
+        ) : null}
       </View>
 
       <Pressable style={styles.secondaryButton} onPress={onBack}>
@@ -1405,8 +1477,9 @@ function QuoteFormScreen({
     const filamentCost = filamentList.reduce((sum, line) => sum + line.usedWeightGrams * 2, 0);
     const extraCostCents = extraList.reduce((sum, item) => sum + item.itemCostCents, 0);
     const subtotal = filamentCost + extraCostCents + parsedPackaging;
-    const taxCostCents = Math.round(subtotal * (taxRatePercent / 100));
-    const finalWithMarkupCents = Math.round((subtotal + taxCostCents) * 1.65);
+    const withMarkupCents = Math.round(subtotal * 1.65);
+    const taxCostCents = Math.round(withMarkupCents * (taxRatePercent / 100));
+    const finalWithMarkupCents = withMarkupCents + taxCostCents;
 
     onSave({
       id: quoteDraftId,
@@ -2441,6 +2514,30 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700",
     textAlign: "center",
+  },
+  formulaButton: {
+    backgroundColor: "#eef3ff",
+    borderWidth: 1,
+    borderColor: "#c7d7fb",
+    minHeight: 28,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  formulaButtonText: {
+    color: "#23407e",
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  formulaText: {
+    fontSize: 12,
+    color: "#334260",
+    backgroundColor: "#f4f7ff",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
   },
   modalOverlay: {
     flex: 1,

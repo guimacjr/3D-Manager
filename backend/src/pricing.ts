@@ -63,10 +63,11 @@ export function computeQuote(input: QuoteComputationInput): QuoteComputationResu
     paybackBatchCents +
     laborBatchCents;
 
-  const taxBatchCents = Math.round((subtotalBatchCents * input.taxRateBps) / 10000);
-  const finalBatchCents = Math.round(
-    (subtotalBatchCents + taxBatchCents) * (1 + input.markupBps / 10000)
+  const withMarkupBatchCents = Math.round(
+    subtotalBatchCents * (1 + input.markupBps / 10000)
   );
+  const taxBatchCents = Math.round((withMarkupBatchCents * input.taxRateBps) / 10000);
+  const finalBatchCents = withMarkupBatchCents + taxBatchCents;
 
   return {
     subtotalBatchCents,
