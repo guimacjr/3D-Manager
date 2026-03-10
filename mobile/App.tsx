@@ -8,6 +8,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from "react-native";
 
@@ -1252,14 +1253,22 @@ function QuoteFormScreen({
   initialData,
   filaments,
   printers,
+  laborHourCostCents,
+  energyCostKwhCents,
+  paybackMonths,
   taxRatePercent,
+  markupPercent,
   onSave,
   onCancel,
 }: {
   initialData?: Quote;
   filaments: Filament[];
   printers: Printer[];
+  laborHourCostCents: number;
+  energyCostKwhCents: number;
+  paybackMonths: number;
   taxRatePercent: number;
+  markupPercent: number;
   onSave: (quote: Quote) => void;
   onCancel: () => void;
 }) {
@@ -1290,6 +1299,7 @@ function QuoteFormScreen({
   const [extraList, setExtraList] = useState<QuoteExtraCost[]>(initialData?.extraCosts ?? []);
   const [editingExtraId, setEditingExtraId] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const [isPreviewVisible, setIsPreviewVisible] = useState(true);
 
   useEffect(() => {
     setQuoteDraftId(initialData?.id ?? createId("quote"));
@@ -1314,6 +1324,7 @@ function QuoteFormScreen({
     setExtraName("");
     setExtraCost("");
     setFormError(null);
+    setIsPreviewVisible(true);
   }, [initialData, filaments, printers]);
 
   const addMediaFromPicker = async (type: "photo" | "video" | "3mf") => {
@@ -1450,6 +1461,109 @@ function QuoteFormScreen({
     setExtraCost("");
   };
 
+  const selectedPrinter = printers.find((item) => item.id === selectedPrinterId) ?? printers[0];
+  const isWebSplitLayout = Platform.OS === "web";
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const canPinPreview = isWebSplitLayout && windowWidth >= 1180;
+  const shouldPinPreview = canPinPreview && isPreviewVisible;
+  const contentMaxWidth = 1400;
+  const contentWidth = Math.min(windowWidth, contentMaxWidth);
+  const contentRightGutter = Math.max(0, (windowWidth - contentWidth) / 2);
+  const previewFixedWidth = Math.min(360, Math.max(280, windowWidth - 48));
+  const previewFixedMaxHeight = Math.max(240, windowHeight - 120);
+  const previewRightOffset = Math.max(12, contentRightGutter + 12);
+  const previewSummaryCard = (extraStyle?: any) => (
+    <View style={[styles.card, styles.quoteFormPreviewSticky, extraStyle]}>
+      <View style={styles.summaryHeader}>
+        <Text style={styles.cardTitle}>Resumo em tempo real</Text>
+        <Pressable style={styles.summaryToggleButton} onPress={() => setIsPreviewVisible(false)}>
+          <Text allowFontScaling={false} style={styles.summaryToggleButtonText}>
+            X
+          </Text>
+        </Pressable>
+      </View>
+      <Text style={styles.pageSubtitle}>Atualiza conforme você altera os campos.</Text>
+      <Text style={styles.text}>
+        Impressora: {selectedPrinter ? `${selectedPrinter.name} (${selectedPrinter.model})` : "Nao definida"}
+      </Text>
+      <Text style={styles.text}>Unidades no lote: {previewQuote.unitsProduced}</Text>
+      <Text style={styles.text}>Filamentos no lote: {money(filamentBatchTotalCents)}</Text>
+      <Text style={styles.text}>Extras no lote: {money(extrasBatchTotalCents)}</Text>
+      <Text style={styles.text}>Embalagem no lote: {money(packagingBatchTotalCents)}</Text>
+      <Text style={styles.text}>Energia no lote: {money(energyTotalCents)}</Text>
+      <Text style={styles.text}>Payback no lote: {money(paybackTotalCents)}</Text>
+      <Text style={styles.text}>Mao de obra no lote: {money(laborTotalCents)}</Text>
+      <Text style={styles.text}>Subtotal no lote: {money(previewTotals.subtotalBatchCents)}</Text>
+      <Text style={styles.text}>Imposto no lote: {money(previewTotals.taxBatchCents)}</Text>
+      <Text style={styles.text}>Final no lote: {money(previewTotals.finalBatchCents)}</Text>
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Por unidade</Text>
+        <Text style={styles.text}>Subtotal: {money(previewTotals.subtotalUnitCents)}</Text>
+        <Text style={styles.text}>Imposto: {money(previewTotals.taxUnitCents)}</Text>
+        <Text style={styles.text}>Preço final: {money(previewTotals.finalUnitCents)}</Text>
+      </View>
+    </View>
+  );
+
+  const parsedPrintTimePreview = parseLocaleNumber(printTime);
+  const parsedPostTimePreview = parseLocaleNumber(postTime);
+  const parsedPackagingValuePreview = packagingCost.trim() === "" ? 0 : parseLocaleNumber(packagingCost);
+  const parsedUnitsProducedPreview = Math.max(1, Math.round(parseLocaleNumber(unitsProduced) || 1));
+
+  const safePrintTime = Number.isFinite(parsedPrintTimePreview) && parsedPrintTimePreview >= 0 ? parsedPrintTimePreview : 0;
+  const safePostTime = Number.isFinite(parsedPostTimePreview) && parsedPostTimePreview >= 0 ? parsedPostTimePreview : 0;
+  const safePackaging =
+    Number.isFinite(parsedPackagingValuePreview) && parsedPackagingValuePreview >= 0
+      ? Math.round(parsedPackagingValuePreview * 100)
+      : 0;
+
+  const previewQuote: Quote = {
+    id: quoteDraftId,
+    printerId: selectedPrinterId,
+    name: name.trim(),
+    description: description.trim(),
+    unitsProduced: parsedUnitsProducedPreview,
+    printTimeMin: safePrintTime,
+    postProcessingMin: safePostTime,
+    packagingCostCents: safePackaging,
+    productionCostCents: 0,
+    taxCostCents: 0,
+    salePriceCents: 0,
+    media3mf: media3mfList,
+    mediaPhotos,
+    mediaVideos,
+    filamentUsages: filamentList,
+    extraCosts: extraList,
+  };
+
+  const previewTotals = computeQuoteDisplayTotals({
+    quote: previewQuote,
+    filaments,
+    printers,
+    laborHourCostCents,
+    energyCostKwhCents,
+    paybackMonths,
+    taxRatePercent,
+    markupPercent,
+  });
+
+  const totalPrintTimeMin = previewQuote.printTimeMin * previewQuote.unitsProduced;
+  const totalPostProcessingMin = previewQuote.postProcessingMin * previewQuote.unitsProduced;
+  const energyPerHourCents = selectedPrinter ? (selectedPrinter.powerWatts / 1000) * energyCostKwhCents : 0;
+  const paybackPerHourCents = selectedPrinter
+    ? selectedPrinter.purchaseCostCents / (Math.max(1, paybackMonths) * 30 * 20)
+    : 0;
+  const energyTotalCents = Math.round(energyPerHourCents * (totalPrintTimeMin / 60));
+  const paybackTotalCents = Math.round(paybackPerHourCents * (totalPrintTimeMin / 60));
+  const laborTotalCents = Math.round((totalPostProcessingMin / 60) * laborHourCostCents);
+  const filamentBatchTotalCents = filamentList.reduce((sum, line) => {
+    const filament = filaments.find((item) => item.name === line.filamentName);
+    const unitCostPerGramCents = filament ? filament.purchaseCostCents / filament.purchasedWeightGrams : 0;
+    return sum + Math.round(line.usedWeightGrams * unitCostPerGramCents);
+  }, 0);
+  const extrasBatchTotalCents = extraList.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const packagingBatchTotalCents = previewQuote.packagingCostCents * previewQuote.unitsProduced;
+
   const handleSave = () => {
     const parsedPrintTime = parseLocaleNumber(printTime);
     const parsedPostTime = parseLocaleNumber(postTime);
@@ -1474,13 +1588,6 @@ function QuoteFormScreen({
     }
     setFormError(null);
 
-    const filamentCost = filamentList.reduce((sum, line) => sum + line.usedWeightGrams * 2, 0);
-    const extraCostCents = extraList.reduce((sum, item) => sum + item.itemCostCents, 0);
-    const subtotal = filamentCost + extraCostCents + parsedPackaging;
-    const withMarkupCents = Math.round(subtotal * 1.65);
-    const taxCostCents = Math.round(withMarkupCents * (taxRatePercent / 100));
-    const finalWithMarkupCents = withMarkupCents + taxCostCents;
-
     onSave({
       id: quoteDraftId,
       printerId: selectedPrinterId,
@@ -1490,9 +1597,9 @@ function QuoteFormScreen({
       printTimeMin: parsedPrintTime,
       postProcessingMin: parsedPostTime,
       packagingCostCents: parsedPackaging,
-      productionCostCents: subtotal,
-      taxCostCents,
-      salePriceCents: finalWithMarkupCents,
+      productionCostCents: previewTotals.subtotalUnitCents,
+      taxCostCents: previewTotals.taxUnitCents,
+      salePriceCents: previewTotals.finalUnitCents,
       media3mf: media3mfList,
       mediaPhotos,
       mediaVideos,
@@ -1502,193 +1609,248 @@ function QuoteFormScreen({
   };
 
   return (
-    <ScrollView contentContainerStyle={styles.content}>
-      <Text style={styles.pageTitle}>{initialData ? "Editar Orçamento" : "Novo Orçamento"}</Text>
+    <View style={styles.quoteFormScreenRoot}>
+      <ScrollView
+        contentContainerStyle={[
+          styles.content,
+          isWebSplitLayout && styles.quoteFormContentWeb,
+          shouldPinPreview ? { paddingRight: previewFixedWidth + 20 } : null,
+        ]}
+      >
+        <Text style={styles.pageTitle}>{initialData ? "Editar Orçamento" : "Novo Orçamento"}</Text>
+        <View style={[styles.quoteFormSplit, isWebSplitLayout && styles.quoteFormSplitWeb]}>
+          <View style={[styles.quoteFormMainColumn, isWebSplitLayout && styles.quoteFormMainColumnWeb]}>
+          <Field label="Nome do objeto" value={name} onChangeText={setName} />
+          <Field label="Descrição" value={description} onChangeText={setDescription} multiline />
+          <SelectField
+            label="Impressora"
+            value={printers.find((item) => item.id === selectedPrinterId)?.name ?? ""}
+            placeholder="Selecione uma impressora"
+            options={printers.map((item) => item.name)}
+            emptyText="Nenhuma impressora cadastrada."
+            isOpen={isPrinterDropdownOpen}
+            onToggle={() => setIsPrinterDropdownOpen((prev) => !prev)}
+            onSelect={(printerName) => {
+              const selected = printers.find((item) => item.name === printerName);
+              if (!selected) return;
+              setSelectedPrinterId(selected.id);
+              setIsPrinterDropdownOpen(false);
+            }}
+          />
+          <Field
+            label="Unidades produzidas"
+            value={unitsProduced}
+            onChangeText={setUnitsProduced}
+            keyboardType="numeric"
+          />
 
-      <Field label="Nome do objeto" value={name} onChangeText={setName} />
-      <Field label="Descrição" value={description} onChangeText={setDescription} multiline />
-      <SelectField
-        label="Impressora"
-        value={printers.find((item) => item.id === selectedPrinterId)?.name ?? ""}
-        placeholder="Selecione uma impressora"
-        options={printers.map((item) => item.name)}
-        emptyText="Nenhuma impressora cadastrada."
-        isOpen={isPrinterDropdownOpen}
-        onToggle={() => setIsPrinterDropdownOpen((prev) => !prev)}
-        onSelect={(printerName) => {
-          const selected = printers.find((item) => item.name === printerName);
-          if (!selected) return;
-          setSelectedPrinterId(selected.id);
-          setIsPrinterDropdownOpen(false);
-        }}
-      />
-      <Field
-        label="Unidades produzidas"
-        value={unitsProduced}
-        onChangeText={setUnitsProduced}
-        keyboardType="numeric"
-      />
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Mídias</Text>
+            <Pressable style={styles.wideButton} onPress={() => void addMediaFromPicker("3mf")}>
+              <Text allowFontScaling={false} numberOfLines={1} style={styles.wideButtonText}>
+                Selecionar arquivo .3mf
+              </Text>
+            </Pressable>
+            <Pressable style={styles.wideButton} onPress={() => void addMediaFromPicker("photo")}>
+              <Text allowFontScaling={false} numberOfLines={1} style={styles.wideButtonText}>
+                Selecionar imagens
+              </Text>
+            </Pressable>
+            <Pressable style={styles.wideButton} onPress={() => void addMediaFromPicker("video")}>
+              <Text allowFontScaling={false} numberOfLines={1} style={styles.wideButtonText}>
+                Selecionar videos
+              </Text>
+            </Pressable>
+            <Text style={styles.text}>Arquivos 3mf:</Text>
+            {media3mfList.map((item) => (
+              <Text key={item} style={styles.text}>
+                - {item}
+              </Text>
+            ))}
+            <Text style={styles.text}>Imagens:</Text>
+            {mediaPhotos.map((item) => (
+              <Text key={item} style={styles.text}>
+                - {item}
+              </Text>
+            ))}
+            <Text style={styles.text}>Videos:</Text>
+            {mediaVideos.map((item) => (
+              <Text key={item} style={styles.text}>
+                - {item}
+              </Text>
+            ))}
+          </View>
 
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Mídias</Text>
-        <Pressable style={styles.wideButton} onPress={() => void addMediaFromPicker("3mf")}>
-          <Text allowFontScaling={false} numberOfLines={1} style={styles.wideButtonText}>
-            Selecionar arquivo .3mf
-          </Text>
-        </Pressable>
-        <Pressable style={styles.wideButton} onPress={() => void addMediaFromPicker("photo")}>
-          <Text allowFontScaling={false} numberOfLines={1} style={styles.wideButtonText}>
-            Selecionar imagens
-          </Text>
-        </Pressable>
-        <Pressable style={styles.wideButton} onPress={() => void addMediaFromPicker("video")}>
-          <Text allowFontScaling={false} numberOfLines={1} style={styles.wideButtonText}>
-            Selecionar videos
-          </Text>
-        </Pressable>
-        <Text style={styles.text}>Arquivos 3mf:</Text>
-        {media3mfList.map((item) => (
-          <Text key={item} style={styles.text}>
-            - {item}
-          </Text>
-        ))}
-        <Text style={styles.text}>Imagens:</Text>
-        {mediaPhotos.map((item) => (
-          <Text key={item} style={styles.text}>
-            - {item}
-          </Text>
-        ))}
-        <Text style={styles.text}>Videos:</Text>
-        {mediaVideos.map((item) => (
-          <Text key={item} style={styles.text}>
-            - {item}
-          </Text>
-        ))}
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Filamentos</Text>
-        <SelectField
-          label="Filamento"
-          value={filamentName}
-          placeholder="Selecione um filamento"
-          options={filaments.map((item) => item.name)}
-          emptyText="Nenhum filamento cadastrado."
-          isOpen={isFilamentDropdownOpen}
-          onToggle={() => setIsFilamentDropdownOpen((prev) => !prev)}
-          onSelect={(value) => {
-            setFilamentName(value);
-            setIsFilamentDropdownOpen(false);
-          }}
-        />
-        <Field
-          label="Quantidade usada (g)"
-          value={filamentWeight}
-          onChangeText={setFilamentWeight}
-          keyboardType="numeric"
-        />
-        <Pressable style={styles.primaryButtonFixed} onPress={addFilament}>
-          <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
-            {editingFilamentLineId ? "Salvar filamento" : "Adicionar filamento"}
-          </Text>
-        </Pressable>
-        {editingFilamentLineId && (
-          <Pressable style={styles.secondaryButton} onPress={cancelFilamentEdit}>
-            <Text allowFontScaling={false} style={styles.secondaryButtonText}>
-              Cancelar edicao
-            </Text>
-          </Pressable>
-        )}
-        {filamentList.map((line) => (
-          <View key={line.id} style={styles.card}>
-            <Text style={styles.text}>
-              {line.filamentName}: {line.usedWeightGrams}g
-            </Text>
-            <View style={styles.row}>
-              <Pressable style={styles.smallButton} onPress={() => editFilamentLine(line)}>
-                <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
-                  Editar
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Filamentos</Text>
+            <SelectField
+              label="Filamento"
+              value={filamentName}
+              placeholder="Selecione um filamento"
+              options={filaments.map((item) => item.name)}
+              emptyText="Nenhum filamento cadastrado."
+              isOpen={isFilamentDropdownOpen}
+              onToggle={() => setIsFilamentDropdownOpen((prev) => !prev)}
+              onSelect={(value) => {
+                setFilamentName(value);
+                setIsFilamentDropdownOpen(false);
+              }}
+            />
+            <Field
+              label="Quantidade usada (g)"
+              value={filamentWeight}
+              onChangeText={setFilamentWeight}
+              keyboardType="numeric"
+            />
+            <Pressable style={styles.primaryButtonFixed} onPress={addFilament}>
+              <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+                {editingFilamentLineId ? "Salvar filamento" : "Adicionar filamento"}
+              </Text>
+            </Pressable>
+            {editingFilamentLineId && (
+              <Pressable style={styles.secondaryButton} onPress={cancelFilamentEdit}>
+                <Text allowFontScaling={false} style={styles.secondaryButtonText}>
+                  Cancelar edicao
                 </Text>
               </Pressable>
-              <Pressable style={styles.dangerButton} onPress={() => removeFilamentLine(line.id)}>
-                <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
-                  Remover
+            )}
+            {filamentList.map((line) => (
+              <View key={line.id} style={styles.card}>
+                <Text style={styles.text}>
+                  {line.filamentName}: {line.usedWeightGrams}g
+                </Text>
+                <View style={styles.row}>
+                  <Pressable style={styles.smallButton} onPress={() => editFilamentLine(line)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                      Editar
+                    </Text>
+                  </Pressable>
+                  <Pressable style={styles.dangerButton} onPress={() => removeFilamentLine(line.id)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
+                      Remover
+                    </Text>
+                  </Pressable>
+                </View>
+              </View>
+            ))}
+          </View>
+
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Tempos</Text>
+            <Field
+              label="Tempo de impressao (min)"
+              value={printTime}
+              onChangeText={setPrintTime}
+              keyboardType="numeric"
+            />
+            <Field
+              label="Tempo de pós-produção (min)"
+              value={postTime}
+              onChangeText={setPostTime}
+              keyboardType="numeric"
+            />
+          </View>
+
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Itens extras</Text>
+            <Field label="Nome do item" value={extraName} onChangeText={setExtraName} />
+            <Field label="Custo (R$)" value={extraCost} onChangeText={setExtraCost} keyboardType="numeric" />
+            <Pressable style={styles.primaryButtonFixed} onPress={addExtra}>
+              <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+                {editingExtraId ? "Salvar item extra" : "Adicionar item extra"}
+              </Text>
+            </Pressable>
+            {editingExtraId && (
+              <Pressable style={styles.secondaryButton} onPress={cancelExtraEdit}>
+                <Text allowFontScaling={false} style={styles.secondaryButtonText}>
+                  Cancelar edicao
+                </Text>
+              </Pressable>
+            )}
+            {extraList.map((item) => (
+              <View key={item.id} style={styles.card}>
+                <Text style={styles.text}>
+                  {item.itemName}: {money(item.itemCostCents)}
+                </Text>
+                <View style={styles.row}>
+                  <Pressable style={styles.smallButton} onPress={() => editExtraItem(item)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                      Editar
+                    </Text>
+                  </Pressable>
+                  <Pressable style={styles.dangerButton} onPress={() => removeExtraItem(item.id)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
+                      Remover
+                    </Text>
+                  </Pressable>
+                </View>
+              </View>
+            ))}
+          </View>
+
+          <Field
+            label="Custo de embalagem (R$)"
+            value={packagingCost}
+            onChangeText={setPackagingCost}
+            keyboardType="numeric"
+          />
+          {formError ? <Text style={styles.errorText}>{formError}</Text> : null}
+
+          <View style={styles.row}>
+            <Pressable style={styles.primaryButtonFixed} onPress={handleSave}>
+              <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+                Salvar
+              </Text>
+            </Pressable>
+            <Pressable style={styles.secondaryButton} onPress={onCancel}>
+              <Text allowFontScaling={false} numberOfLines={1} style={styles.secondaryButtonText}>
+                Cancelar
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+
+          {isPreviewVisible && !canPinPreview && (
+            <View style={[styles.quoteFormPreviewColumn, isWebSplitLayout && styles.quoteFormPreviewColumnWeb]}>
+              {previewSummaryCard()}
+            </View>
+          )}
+          {!isPreviewVisible && !canPinPreview && (
+            <View style={[styles.quoteFormPreviewColumn, isWebSplitLayout && styles.quoteFormPreviewColumnWeb]}>
+              <Pressable style={styles.summaryRevealButton} onPress={() => setIsPreviewVisible(true)}>
+                <Text allowFontScaling={false} style={styles.summaryRevealButtonText}>
+                  {"<-"}
                 </Text>
               </Pressable>
             </View>
+          )}
+        </View>
+      </ScrollView>
+
+      {isPreviewVisible && shouldPinPreview && (
+        <View pointerEvents="box-none" style={styles.quoteFormFloatingHost}>
+          <View
+            style={[
+              styles.quoteFormPreviewFloating,
+              { width: previewFixedWidth, maxHeight: previewFixedMaxHeight, right: previewRightOffset },
+            ]}
+          >
+            {previewSummaryCard({ maxHeight: previewFixedMaxHeight, overflow: "auto" })}
           </View>
-        ))}
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Tempos</Text>
-        <Field label="Tempo de impressao (min)" value={printTime} onChangeText={setPrintTime} keyboardType="numeric" />
-        <Field
-          label="Tempo de pós-produção (min)"
-          value={postTime}
-          onChangeText={setPostTime}
-          keyboardType="numeric"
-        />
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Itens extras</Text>
-        <Field label="Nome do item" value={extraName} onChangeText={setExtraName} />
-        <Field label="Custo (R$)" value={extraCost} onChangeText={setExtraCost} keyboardType="numeric" />
-        <Pressable style={styles.primaryButtonFixed} onPress={addExtra}>
-          <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
-            {editingExtraId ? "Salvar item extra" : "Adicionar item extra"}
-          </Text>
-        </Pressable>
-        {editingExtraId && (
-          <Pressable style={styles.secondaryButton} onPress={cancelExtraEdit}>
-            <Text allowFontScaling={false} style={styles.secondaryButtonText}>
-              Cancelar edicao
-            </Text>
-          </Pressable>
-        )}
-        {extraList.map((item) => (
-          <View key={item.id} style={styles.card}>
-            <Text style={styles.text}>
-              {item.itemName}: {money(item.itemCostCents)}
-            </Text>
-            <View style={styles.row}>
-              <Pressable style={styles.smallButton} onPress={() => editExtraItem(item)}>
-                <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
-                  Editar
-                </Text>
-              </Pressable>
-              <Pressable style={styles.dangerButton} onPress={() => removeExtraItem(item.id)}>
-                <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
-                  Remover
-                </Text>
-              </Pressable>
-            </View>
+        </View>
+      )}
+      {!isPreviewVisible && canPinPreview && (
+        <View pointerEvents="box-none" style={styles.quoteFormFloatingHost}>
+          <View style={[styles.quoteFormRevealFloating, { right: previewRightOffset }]}>
+            <Pressable style={styles.summaryRevealButton} onPress={() => setIsPreviewVisible(true)}>
+              <Text allowFontScaling={false} style={styles.summaryRevealButtonText}>
+                {"<-"}
+              </Text>
+            </Pressable>
           </View>
-        ))}
-      </View>
-
-      <Field
-        label="Custo de embalagem (R$)"
-        value={packagingCost}
-        onChangeText={setPackagingCost}
-        keyboardType="numeric"
-      />
-      {formError ? <Text style={styles.errorText}>{formError}</Text> : null}
-
-      <View style={styles.row}>
-        <Pressable style={styles.primaryButtonFixed} onPress={handleSave}>
-          <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
-            Salvar
-          </Text>
-        </Pressable>
-        <Pressable style={styles.secondaryButton} onPress={onCancel}>
-          <Text allowFontScaling={false} numberOfLines={1} style={styles.secondaryButtonText}>
-            Cancelar
-          </Text>
-        </Pressable>
-      </View>
-    </ScrollView>
+        </View>
+      )}
+    </View>
   );
 }
 
@@ -2186,7 +2348,11 @@ export default function MockupApp() {
           initialData={currentQuote}
           filaments={filaments}
           printers={printers}
+          laborHourCostCents={Math.round((parseLocaleNumber(laborHourCost) || 0) * 100)}
+          energyCostKwhCents={parseLocaleNumber(energyCostKwh) || 0}
+          paybackMonths={parseLocaleNumber(paybackMonths) || 1}
           taxRatePercent={parseLocaleNumber(taxRate) || 0}
+          markupPercent={65}
           onSave={(quote) => {
             void (async () => {
               try {
@@ -2310,6 +2476,93 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 28,
     gap: 12,
+  },
+  quoteFormScreenRoot: {
+    flex: 1,
+  },
+  quoteFormContentWeb: {
+    maxWidth: 1400,
+    width: "100%",
+    alignSelf: "center",
+  },
+  quoteFormSplit: {
+    gap: 12,
+  },
+  quoteFormSplitWeb: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+  },
+  quoteFormMainColumn: {
+    gap: 12,
+  },
+  quoteFormMainColumnWeb: {
+    flex: 1.8,
+  },
+  quoteFormPreviewColumn: {
+    gap: 12,
+  },
+  quoteFormPreviewColumnWeb: {
+    flex: 1,
+  },
+  quoteFormPreviewSticky: {
+    borderColor: "#dbe7ff",
+    borderWidth: 1,
+  },
+  summaryHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  summaryToggleButton: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#eef3ff",
+    borderWidth: 1,
+    borderColor: "#c7d7fb",
+  },
+  summaryToggleButtonText: {
+    color: "#23407e",
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 12,
+  },
+  summaryRevealButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#eef3ff",
+    borderWidth: 1,
+    borderColor: "#c7d7fb",
+  },
+  summaryRevealButtonText: {
+    color: "#23407e",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  quoteFormFloatingHost: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  quoteFormPreviewFloating: {
+    position: "absolute",
+    top: 96,
+    right: 16,
+    zIndex: 10,
+  },
+  quoteFormRevealFloating: {
+    position: "absolute",
+    top: 96,
+    right: 16,
+    zIndex: 11,
   },
   pageTitle: {
     fontSize: 22,
