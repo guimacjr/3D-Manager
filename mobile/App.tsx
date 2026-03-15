@@ -43,6 +43,7 @@ type Filament = {
   color: string;
   materialType: string;
   purchaseLink: string;
+  notes: string;
   purchaseCostCents: number;
   purchasedWeightGrams: number;
 };
@@ -115,6 +116,7 @@ const filamentsSeed: Filament[] = [
     color: "Ouro",
     materialType: "PLA",
     purchaseLink: "https://loja.exemplo/pla-ouro",
+    notes: "",
     purchaseCostCents: 12900,
     purchasedWeightGrams: 1000,
   },
@@ -125,6 +127,7 @@ const filamentsSeed: Filament[] = [
     color: "Preto",
     materialType: "PETG",
     purchaseLink: "https://loja.exemplo/petg-preto",
+    notes: "",
     purchaseCostCents: 14990,
     purchasedWeightGrams: 1000,
   },
@@ -288,6 +291,7 @@ function mapFilamentFromApi(row: any): Filament {
     color: row.color,
     materialType: row.material_type,
     purchaseLink: row.purchase_link ?? "",
+    notes: row.notes ?? "",
     purchaseCostCents: row.purchase_cost_cents,
     purchasedWeightGrams: row.purchased_weight_grams,
   };
@@ -761,6 +765,7 @@ function FilamentFormScreen({
   const [color, setColor] = useState(initialData?.color ?? "");
   const [material, setMaterial] = useState(initialData?.materialType ?? "");
   const [link, setLink] = useState(initialData?.purchaseLink ?? "");
+  const [notes, setNotes] = useState(initialData?.notes ?? "");
 
   useEffect(() => {
     setName(initialData?.name ?? "");
@@ -770,6 +775,7 @@ function FilamentFormScreen({
     setColor(initialData?.color ?? "");
     setMaterial(initialData?.materialType ?? "");
     setLink(initialData?.purchaseLink ?? "");
+    setNotes(initialData?.notes ?? "");
   }, [initialData]);
 
   const handleSave = () => {
@@ -795,6 +801,7 @@ function FilamentFormScreen({
       color: color.trim(),
       materialType: material.trim(),
       purchaseLink: link.trim(),
+      notes: notes.trim(),
       purchaseCostCents: parsedCostCents,
       purchasedWeightGrams: parsedWeight,
     });
@@ -812,6 +819,7 @@ function FilamentFormScreen({
       <Field label="Cor" value={color} onChangeText={setColor} />
       <Field label="Tipo de material" value={material} onChangeText={setMaterial} />
       <Field label="Link de compra" value={link} onChangeText={setLink} />
+      <Field label="Notas" value={notes} onChangeText={setNotes} multiline />
 
       <View style={styles.row}>
         <Pressable style={styles.primaryButtonFixed} onPress={handleSave}>
@@ -2218,6 +2226,7 @@ export default function MockupApp() {
                   color: filament.color,
                   material_type: filament.materialType,
                   purchase_link: filament.purchaseLink || "",
+                  notes: filament.notes || "",
                   purchase_cost_cents: Math.round(purchaseCostCents),
                   purchased_weight_grams: Math.round(purchasedWeightGrams),
                 };

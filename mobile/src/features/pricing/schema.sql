@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS filaments (
   color TEXT NOT NULL,
   material_type TEXT NOT NULL,
   purchase_link TEXT,
+  notes TEXT,
   purchase_cost_cents INTEGER NOT NULL CHECK (purchase_cost_cents >= 0),
   purchased_weight_grams INTEGER NOT NULL CHECK (purchased_weight_grams > 0),
   cost_per_gram_cents INTEGER NOT NULL,

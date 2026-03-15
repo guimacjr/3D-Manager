@@ -62,6 +62,7 @@ const filamentSchema = z.object({
   color: z.string().min(1),
   material_type: z.string().min(1),
   purchase_link: z.string().url().optional().or(z.literal("")),
+  notes: z.string().optional().default(""),
   purchase_cost_cents: z.number().int().nonnegative(),
   purchased_weight_grams: z.number().int().positive(),
 });
@@ -269,10 +270,10 @@ app.post("/filaments", async (request, reply) => {
 
   db.prepare(
     `INSERT INTO filaments (
-      id, name, brand, color, material_type, purchase_link,
+      id, name, brand, color, material_type, purchase_link, notes,
       purchase_cost_cents, purchased_weight_grams, cost_per_gram_cents, cost_per_kg_cents,
       is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
   ).run(
     id,
     body.name,
@@ -280,6 +281,7 @@ app.post("/filaments", async (request, reply) => {
     body.color,
     body.material_type,
     body.purchase_link || null,
+    body.notes || "",
     body.purchase_cost_cents,
     body.purchased_weight_grams,
     costPerGram,
@@ -300,7 +302,7 @@ app.put("/filaments/:id", async (request) => {
 
   db.prepare(
     `UPDATE filaments
-     SET name = ?, brand = ?, color = ?, material_type = ?, purchase_link = ?,
+     SET name = ?, brand = ?, color = ?, material_type = ?, purchase_link = ?, notes = ?,
          purchase_cost_cents = ?, purchased_weight_grams = ?, cost_per_gram_cents = ?,
          cost_per_kg_cents = ?, updated_at = ?
      WHERE id = ?`
@@ -310,6 +312,7 @@ app.put("/filaments/:id", async (request) => {
     body.color,
     body.material_type,
     body.purchase_link || null,
+    body.notes || "",
     body.purchase_cost_cents,
     body.purchased_weight_grams,
     costPerGram,
