@@ -17,7 +17,7 @@ Servidor padrao: `http://localhost:3333`
 
 ## Rotas principais
 - `GET /health`
-- `POST /uploads` (upload de `photo`, `video`, `3mf`)
+- `POST /uploads` (upload de `photo`, `video`, `3mf`; aceita `owner_type=quotes|skus` e `owner_id`)
 - `GET /printers`
 - `POST /printers`
 - `PUT /printers/:id`
@@ -35,6 +35,24 @@ Servidor padrao: `http://localhost:3333`
 - `POST /quotes`
 - `PUT /quotes/:id`
 - `DELETE /quotes/:id`
+- `GET /sales/skus`
+- `GET /sales/skus/:id`
+- `GET /sales/skus/:id/media`
+- `POST /sales/skus`
+- `PUT /sales/skus/:id`
+- `DELETE /sales/skus/:id` (soft delete)
+- `GET /sales/points`
+- `POST /sales/points`
+- `PUT /sales/points/:id`
+- `DELETE /sales/points/:id` (soft delete)
+- `GET /sales/stock/overview`
+- `POST /sales/stock/movements`
+- `POST /sales/consignment/batches`
+- `GET /sales/consignment/batches`
+- `GET /sales/consignment/batches/:id`
+- `POST /sales/consignment/batch-items/:id/sales`
+- `POST /sales/consignment/batch-items/:id/returns`
+- `GET /sales/points/overview`
 
 ## Notas de calculo no POST /quotes
 - Recebe `units_produced` (default 1)
@@ -48,6 +66,20 @@ Servidor padrao: `http://localhost:3333`
   - `subtotal_batch_cents`
   - `tax_batch_cents`
   - `final_batch_cents`
+- Retorna margem de contribuicao por unidade:
+  - `contribution_margin_cents`
+  - `contribution_margin_bps`
+
+## Margem de contribuicao (quotes e SKUs)
+- Quotes:
+  - `contribution_margin_cents = final_price_cents - subtotal_cost_cents - tax_cost_cents`
+  - `contribution_margin_bps = contribution_margin_cents / final_price_cents * 10000`
+- SKUs:
+  - Quando o SKU esta vinculado a um orcamento (`source_quote_id`), usa o imposto unitario do orcamento (ou o imposto recomputado no modo sync).
+  - Quando nao ha orcamento vinculado, usa imposto estimado embutido no preco atual com a aliquota ativa de `cost_settings`:
+    - `estimated_tax_cents = default_sale_price_cents * tax_rate_bps / (10000 + tax_rate_bps)`
+  - `contribution_margin_cents = default_sale_price_cents - production_cost_cents - estimated_tax_cents`
+  - `contribution_margin_bps = contribution_margin_cents / default_sale_price_cents * 10000`
 
 ## Persistencia de midia local
 - Midias (`photo`, `video`, `3mf`) enviadas no `POST /quotes` sao copiadas fisicamente para:

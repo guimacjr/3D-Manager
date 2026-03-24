@@ -60,6 +60,7 @@ function buildOwnerFolder(mediaRoot: string, ownerType: string, ownerId: string,
 
 export function ensureMediaStorage(mediaRoot: string) {
   fs.mkdirSync(path.join(mediaRoot, "quotes"), { recursive: true });
+  fs.mkdirSync(path.join(mediaRoot, "skus"), { recursive: true });
 }
 
 export function persistMediaFile(params: {
@@ -67,7 +68,7 @@ export function persistMediaFile(params: {
   mediaType: MediaType;
   localUri: string;
   backendRoot: string;
-  ownerType: "quotes";
+  ownerType: "quotes" | "skus";
   ownerId: string;
 }) {
   const { mediaRoot, mediaType, localUri, backendRoot, ownerType, ownerId } = params;
@@ -121,7 +122,7 @@ export function persistUploadedBuffer(params: {
   mediaType: MediaType;
   originalName?: string;
   buffer: Buffer;
-  ownerType: "quotes";
+  ownerType: "quotes" | "skus";
   ownerId: string;
 }) {
   const { mediaRoot, mediaType, originalName, buffer, ownerType, ownerId } = params;
@@ -136,7 +137,7 @@ export function persistUploadedBuffer(params: {
 
   if (fs.existsSync(destAbsolute)) {
     throw new Error(
-      `Ja existe um arquivo com este nome para este orcamento: ${finalName}. Renomeie o arquivo e tente novamente.`
+      `Ja existe um arquivo com este nome para este cadastro: ${finalName}. Renomeie o arquivo e tente novamente.`
     );
   }
 

@@ -61,6 +61,18 @@ Observacao: se ja existir arquivo com mesmo nome no mesmo orcamento/tipo, o back
 
 ## Rodando em desenvolvimento
 
+Atalho para Windows (abre backend e frontend em duas janelas, com API correta):
+
+```powershell
+.\dev.cmd
+```
+
+Opcional (instala dependencias antes de abrir):
+
+```powershell
+.\dev.cmd -Install
+```
+
 ## 1) Backend
 
 ```bash
@@ -108,6 +120,24 @@ EXPO_PUBLIC_API_URL=http://localhost:3333 npx expo start --web
 - `POST /quotes`
 - `PUT /quotes/:id`
 - `DELETE /quotes/:id`
+- `GET /sales/skus`
+- `GET /sales/skus/:id`
+- `GET /sales/skus/:id/media`
+- `POST /sales/skus`
+- `PUT /sales/skus/:id`
+- `DELETE /sales/skus/:id`
+- `GET /sales/points`
+- `POST /sales/points`
+- `PUT /sales/points/:id`
+- `DELETE /sales/points/:id`
+- `GET /sales/stock/overview`
+- `POST /sales/stock/movements`
+- `POST /sales/consignment/batches`
+- `GET /sales/consignment/batches`
+- `GET /sales/consignment/batches/:id`
+- `POST /sales/consignment/batch-items/:id/sales`
+- `POST /sales/consignment/batch-items/:id/returns`
+- `GET /sales/points/overview`
 - `GET /storage/media/*` (download de arquivo salvo)
 
 ## Build desktop portable (`.exe`) - Windows
