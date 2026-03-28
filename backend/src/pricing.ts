@@ -42,7 +42,8 @@ export function computeQuote(input: QuoteComputationInput): QuoteComputationResu
   const paybackPerMinuteCents =
     input.printerPurchaseCostCents / (input.printerPaybackMonths * 20 * 30 * 60);
 
-  const totalPrintMinutes = input.printTimeMinutes * units;
+  // Tempo de impressao e informado para o lote inteiro.
+  const totalPrintMinutes = input.printTimeMinutes;
   const totalPostMinutes = input.postProcessingMinutes * units;
 
   const energyBatchCents = Math.round(energyPerMinuteCents * totalPrintMinutes);
@@ -50,9 +51,10 @@ export function computeQuote(input: QuoteComputationInput): QuoteComputationResu
   // Mao de obra considera apenas tempo humano (pos-processamento).
   const laborBatchCents = Math.round((totalPostMinutes / 60) * input.laborHourCostCents);
 
-  // Filamentos e extras recebidos no formulario sao custos totais do lote.
+  // Filamentos sao informados como custo total do lote.
+  // Extras sao informados como custo por unidade.
   const filamentBatchCents = input.filamentTotalUnitCents;
-  const extrasBatchCents = input.extrasTotalUnitCents;
+  const extrasBatchCents = input.extrasTotalUnitCents * units;
   const packagingBatchCents = input.packagingCostCents * units;
 
   const subtotalBatchCents =

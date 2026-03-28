@@ -746,7 +746,7 @@ function computeQuoteDisplayTotals({
     };
   }
 
-  const totalPrintTimeMin = quote.printTimeMin * unitsProduced;
+  const totalPrintTimeMin = quote.printTimeMin;
   const totalPostProcessingMin = quote.postProcessingMin * unitsProduced;
 
   const energyPerHourCents = (printer.powerWatts / 1000) * energyCostKwhCents;
@@ -766,7 +766,8 @@ function computeQuoteDisplayTotals({
     return sum + lineTotalCents;
   }, 0);
 
-  const extrasBatchTotalCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasUnitTotalCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasBatchTotalCents = extrasUnitTotalCents * unitsProduced;
   const packagingBatchTotalCents = quote.packagingCostCents * unitsProduced;
 
   const subtotalBatchCents =
@@ -805,7 +806,7 @@ function computeQuoteCostWithoutPaybackAndTaxes({
 }) {
   const unitsProduced = Math.max(1, quote.unitsProduced || 1);
   const printer = printers.find((item) => item.id === quote.printerId) ?? printers[0];
-  const totalPrintTimeMin = quote.printTimeMin * unitsProduced;
+  const totalPrintTimeMin = quote.printTimeMin;
   const totalPostProcessingMin = quote.postProcessingMin * unitsProduced;
 
   const energyBatchCents = printer
@@ -819,7 +820,8 @@ function computeQuoteCostWithoutPaybackAndTaxes({
       : 0;
     return sum + Math.round(line.usedWeightGrams * unitCostPerGramCents);
   }, 0);
-  const extrasBatchCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasUnitCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasBatchCents = extrasUnitCents * unitsProduced;
   const packagingBatchCents = quote.packagingCostCents * unitsProduced;
 
   const totalBatchCents =
@@ -1651,7 +1653,7 @@ function QuoteViewScreen({
   const energyPerHourCents = printer
     ? (printer.powerWatts / 1000) * energyCostKwhCents
     : 0;
-  const totalPrintTimeMin = quote.printTimeMin * unitsProduced;
+  const totalPrintTimeMin = quote.printTimeMin;
   const totalPostProcessingMin = quote.postProcessingMin * unitsProduced;
   const energyTotalCents = Math.round(energyPerHourCents * (totalPrintTimeMin / 60));
 
@@ -1680,8 +1682,8 @@ function QuoteViewScreen({
     filamentLines.reduce((sum, line) => sum + line.lineTotalCents, 0) / unitsProduced
   );
   const filamentBatchTotalCents = filamentLines.reduce((sum, line) => sum + line.batchTotalCents, 0);
-  const extrasBatchTotalCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
-  const extrasUnitTotalCents = Math.round(extrasBatchTotalCents / unitsProduced);
+  const extrasUnitTotalCents = quote.extraCosts.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasBatchTotalCents = extrasUnitTotalCents * unitsProduced;
   const packagingBatchTotalCents = quote.packagingCostCents * unitsProduced;
 
   const totals = computeQuoteDisplayTotals({
@@ -1791,7 +1793,7 @@ function QuoteViewScreen({
         {quote.extraCosts.length === 0 && <Text style={styles.text}>Sem insumos extras.</Text>}
         {quote.extraCosts.map((item) => (
           <Text key={item.id} style={styles.text}>
-            - {item.itemName}: {money(item.itemCostCents)}
+            - {item.itemName}: {money(item.itemCostCents)} por unidade
           </Text>
         ))}
         <Text style={styles.text}>Total extras no lote: {money(extrasBatchTotalCents)}</Text>
@@ -2191,7 +2193,7 @@ function QuoteFormScreen({
     markupPercent,
   });
 
-  const totalPrintTimeMin = previewQuote.printTimeMin * previewQuote.unitsProduced;
+  const totalPrintTimeMin = previewQuote.printTimeMin;
   const totalPostProcessingMin = previewQuote.postProcessingMin * previewQuote.unitsProduced;
   const energyPerHourCents = selectedPrinter ? (selectedPrinter.powerWatts / 1000) * energyCostKwhCents : 0;
   const paybackPerHourCents = selectedPrinter
@@ -2205,7 +2207,8 @@ function QuoteFormScreen({
     const unitCostPerGramCents = filament ? filament.purchaseCostCents / filament.purchasedWeightGrams : 0;
     return sum + Math.round(line.usedWeightGrams * unitCostPerGramCents);
   }, 0);
-  const extrasBatchTotalCents = extraList.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasUnitTotalCents = extraList.reduce((sum, item) => sum + item.itemCostCents, 0);
+  const extrasBatchTotalCents = extrasUnitTotalCents * previewQuote.unitsProduced;
   const packagingBatchTotalCents = previewQuote.packagingCostCents * previewQuote.unitsProduced;
   const previewNoPaybackNoTaxBatchCents =
     filamentBatchTotalCents +
@@ -2362,7 +2365,7 @@ function QuoteFormScreen({
               }}
             />
             <Field
-              label="Quantidade usada (g)"
+              label="Quantidade usada (g) (por lote)"
               value={filamentWeight}
               onChangeText={setFilamentWeight}
               keyboardType="numeric"
@@ -2403,13 +2406,13 @@ function QuoteFormScreen({
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Tempos</Text>
             <Field
-              label="Tempo de impressao (min)"
+              label="Tempo de impressao (min) (por lote)"
               value={printTime}
               onChangeText={setPrintTime}
               keyboardType="numeric"
             />
             <Field
-              label="Tempo de pós-produção (min)"
+              label="Tempo de pós-produção (min) (por unidade)"
               value={postTime}
               onChangeText={setPostTime}
               keyboardType="numeric"
@@ -2419,7 +2422,12 @@ function QuoteFormScreen({
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Itens extras</Text>
             <Field label="Nome do item" value={extraName} onChangeText={setExtraName} />
-            <Field label="Custo (R$)" value={extraCost} onChangeText={setExtraCost} keyboardType="numeric" />
+            <Field
+              label="Custo (R$) (por unidade)"
+              value={extraCost}
+              onChangeText={setExtraCost}
+              keyboardType="numeric"
+            />
             <Pressable style={styles.primaryButtonFixed} onPress={addExtra}>
               <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
                 {editingExtraId ? "Salvar item extra" : "Adicionar item extra"}
@@ -2454,7 +2462,7 @@ function QuoteFormScreen({
           </View>
 
           <Field
-            label="Custo de embalagem (R$)"
+            label="Custo de embalagem (R$) (por unidade)"
             value={packagingCost}
             onChangeText={setPackagingCost}
             keyboardType="numeric"
