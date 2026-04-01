@@ -1696,6 +1696,7 @@ function QuoteViewScreen({
     taxRatePercent,
     markupPercent,
   });
+  const withMarkupBatchCents = Math.round(totals.subtotalBatchCents * (1 + markupPercent / 100));
   const contributionCents =
     typeof quote.contributionMarginCents === "number"
       ? quote.contributionMarginCents
@@ -1802,6 +1803,8 @@ function QuoteViewScreen({
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Resumo final</Text>
+        <Text style={styles.text}>Extras por unidade: {money(extrasUnitTotalCents)}</Text>
+        <Text style={styles.text}>Extras no lote: {money(extrasBatchTotalCents)}</Text>
         <View style={styles.row}>
           <Text style={styles.text}>Custo final de producao: {money(totals.subtotalUnitCents)} por unidade</Text>
           <Pressable style={styles.formulaButton} onPress={() => toggleFormula("subtotalUnit")}>
@@ -1810,7 +1813,14 @@ function QuoteViewScreen({
         </View>
         {openFormulaKeys.subtotalUnit ? (
           <Text style={styles.formulaText}>
-            subtotal_un = arred(total_lote / unidades) = arred({money(totals.subtotalBatchCents)} / {unitsProduced})
+            custo_producao_lote = filamentos_lote + extras_lote + embalagem_lote + energia_lote + payback_lote +
+            mao_de_obra_lote{"\n"}
+            custo_producao_lote = {money(filamentBatchTotalCents)} + {money(extrasBatchTotalCents)} +{" "}
+            {money(packagingBatchTotalCents)} + {money(energyTotalCents)} + {money(paybackTotalCents)} +{" "}
+            {money(laborTotalCents)} = {money(totals.subtotalBatchCents)}
+            {"\n"}
+            custo_producao_un = arred(custo_producao_lote / unidades) = arred({money(totals.subtotalBatchCents)} /{" "}
+            {unitsProduced}) = {money(totals.subtotalUnitCents)}
           </Text>
         ) : null}
 
@@ -1822,7 +1832,15 @@ function QuoteViewScreen({
         </View>
         {openFormulaKeys.taxUnit ? (
           <Text style={styles.formulaText}>
-            base_imposto_lote = arred(total_lote x (1 + {markupPercent}%)); imposto_lote = arred(base_imposto_lote x {taxRatePercent}%); imposto_un = arred(imposto_lote / unidades)
+            base_com_markup_lote = arred(custo_producao_lote x (1 + markup)){"\n"}
+            base_com_markup_lote = arred({money(totals.subtotalBatchCents)} x (1 + {markupPercent}%)) ={" "}
+            {money(withMarkupBatchCents)}
+            {"\n"}
+            imposto_lote = arred(base_com_markup_lote x imposto) = arred({money(withMarkupBatchCents)} x{" "}
+            {taxRatePercent}%) = {money(totals.taxBatchCents)}
+            {"\n"}
+            imposto_un = arred(imposto_lote / unidades) = arred({money(totals.taxBatchCents)} / {unitsProduced}) ={" "}
+            {money(totals.taxUnitCents)}
           </Text>
         ) : null}
 
@@ -1834,7 +1852,13 @@ function QuoteViewScreen({
         </View>
         {openFormulaKeys.finalUnit ? (
           <Text style={styles.formulaText}>
-            base_imposto_lote = arred(total_lote x (1 + {markupPercent}%)); final_lote = base_imposto_lote + imposto_lote; final_un = arred(final_lote / unidades)
+            base_com_markup_lote = arred(custo_producao_lote x (1 + markup)) = {money(withMarkupBatchCents)}
+            {"\n"}
+            preco_final_lote = base_com_markup_lote + imposto_lote = {money(withMarkupBatchCents)} +{" "}
+            {money(totals.taxBatchCents)} = {money(totals.finalBatchCents)}
+            {"\n"}
+            preco_final_un = arred(preco_final_lote / unidades) = arred({money(totals.finalBatchCents)} /{" "}
+            {unitsProduced}) = {money(totals.finalUnitCents)}
           </Text>
         ) : null}
 
@@ -1846,7 +1870,17 @@ function QuoteViewScreen({
         </View>
         {openFormulaKeys.subtotalBatch ? (
           <Text style={styles.formulaText}>
-            total_lote = filamentos_lote + extras_lote + embalagem_lote + energia_lote + payback_lote + mao_de_obra_lote
+            custo_producao_lote = filamentos_lote + extras_lote + embalagem_lote + energia_lote + payback_lote +
+            mao_de_obra_lote{"\n"}
+            filamentos_lote = {money(filamentBatchTotalCents)}{"\n"}
+            extras_lote = extras_un x unidades = {money(extrasUnitTotalCents)} x {unitsProduced} ={" "}
+            {money(extrasBatchTotalCents)}{"\n"}
+            embalagem_lote = embalagem_un x unidades = {money(quote.packagingCostCents)} x {unitsProduced} ={" "}
+            {money(packagingBatchTotalCents)}{"\n"}
+            energia_lote = {money(energyTotalCents)}{"\n"}
+            payback_lote = {money(paybackTotalCents)}{"\n"}
+            mao_de_obra_lote = {money(laborTotalCents)}{"\n"}
+            custo_producao_lote = {money(totals.subtotalBatchCents)}
           </Text>
         ) : null}
 
@@ -1858,7 +1892,12 @@ function QuoteViewScreen({
         </View>
         {openFormulaKeys.taxBatch ? (
           <Text style={styles.formulaText}>
-            base_imposto_lote = arred(total_lote x (1 + {markupPercent}%)); imposto_lote = arred(base_imposto_lote x {taxRatePercent}%)
+            base_com_markup_lote = arred(custo_producao_lote x (1 + markup)){"\n"}
+            base_com_markup_lote = arred({money(totals.subtotalBatchCents)} x (1 + {markupPercent}%)) ={" "}
+            {money(withMarkupBatchCents)}
+            {"\n"}
+            imposto_lote = arred(base_com_markup_lote x imposto) = arred({money(withMarkupBatchCents)} x{" "}
+            {taxRatePercent}%) = {money(totals.taxBatchCents)}
           </Text>
         ) : null}
 
@@ -1870,7 +1909,10 @@ function QuoteViewScreen({
         </View>
         {openFormulaKeys.finalBatch ? (
           <Text style={styles.formulaText}>
-            base_imposto_lote = arred(total_lote x (1 + {markupPercent}%)); final_lote = base_imposto_lote + imposto_lote
+            base_com_markup_lote = arred(custo_producao_lote x (1 + markup)) = {money(withMarkupBatchCents)}
+            {"\n"}
+            preco_final_lote = base_com_markup_lote + imposto_lote = {money(withMarkupBatchCents)} +{" "}
+            {money(totals.taxBatchCents)} = {money(totals.finalBatchCents)}
           </Text>
         ) : null}
         <Text style={styles.text}>
