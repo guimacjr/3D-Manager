@@ -1777,6 +1777,7 @@ function QuoteViewScreen({
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Custo de impressao (por hora)</Text>
+        <Text style={styles.text}>Tempo total de impressão contabilizado: {totalPrintTimeMin} min</Text>
         <Text style={styles.text}>Energia por hora (kWh): {money(Math.round(energyPerHourCents))}</Text>
         <Text style={styles.text}>Energia total no lote: {money(energyTotalCents)}</Text>
         <Text style={styles.text}>Payback por hora: {money(Math.round(paybackPerHourCents))}</Text>

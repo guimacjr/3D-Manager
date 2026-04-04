@@ -58,6 +58,68 @@ Observacao: se ja existir arquivo com mesmo nome no mesmo orcamento/tipo, o back
 - Node.js 20+ (recomendado)
 - npm 10+ (recomendado)
 - Windows para build desktop `.exe` portable
+- Docker 24+ com Docker Compose v2 (para release em containers)
+
+## Release com Docker
+
+Este release sobe:
+
+- `backend` (Fastify + SQLite) em `http://localhost:3333`
+- `web` (Expo exportado + Nginx) em `http://localhost:8080`
+
+Persistencia:
+
+- Volume Docker `3d-manager-backend-data` para banco e midias (`/data`)
+
+### 1) Subir ambiente de release
+
+Linux/macOS/WSL:
+
+```bash
+./scripts/docker-up.sh
+```
+
+Windows (CMD):
+
+```bat
+scripts\docker-up.cmd
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/docker-up.ps1
+```
+
+### 2) Ver logs
+
+```bash
+./scripts/docker-logs.sh
+```
+
+Ou somente um servico:
+
+```bash
+./scripts/docker-logs.sh backend
+./scripts/docker-logs.sh web
+```
+
+### 3) Parar ambiente
+
+```bash
+./scripts/docker-down.sh
+```
+
+### 4) Build sem subir
+
+```bash
+./scripts/docker-build.sh
+```
+
+### 5) Configurar URL da API no build web (opcional)
+
+Copie `.env.docker.example` para `.env` e ajuste `EXPO_PUBLIC_API_URL`.
+Por padrao, o compose usa `/api` com proxy interno do Nginx para o backend.
 
 ## Rodando em desenvolvimento
 

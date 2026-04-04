@@ -1,0 +1,43 @@
+name: 3d-manager
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: 3d-manager/backend:latest
+    container_name: 3d-manager-backend
+    environment:
+      PORT: "3333"
+      DB_PATH: /data/data.sqlite
+      MEDIA_ROOT: /data/storage/media
+    volumes:
+      - backend_data:/data
+    ports:
+      - "3333:3333"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3333/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+      args:
+        EXPO_PUBLIC_API_URL: ${EXPO_PUBLIC_API_URL:-/api}
+    image: 3d-manager/web:latest
+    container_name: 3d-manager-web
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  backend_data:
+    name: 3d-manager-backend-data
