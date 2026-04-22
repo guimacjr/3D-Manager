@@ -53,6 +53,30 @@ Servidor padrao: `http://localhost:3333`
 - `POST /sales/consignment/batch-items/:id/sales`
 - `POST /sales/consignment/batch-items/:id/returns`
 - `GET /sales/points/overview`
+- `POST /integrations/mercadolivre/connect`
+- `GET /integrations/mercadolivre/callback`
+- `GET /integrations/mercadolivre/status`
+- `POST /integrations/mercadolivre/disconnect`
+- `POST /integrations/mercadolivre/sync/catalog` (read-only, sincronizacao manual)
+- `GET /integrations/mercadolivre/catalog` (itens sincronizados localmente)
+  - inclui preco base/promocional/efetivo e estimativas de taxas do ML
+- `GET /integrations/mercadolivre/catalog/variations` (cada variacao como anuncio local)
+- `POST /integrations/mercadolivre/sync/orders` (read-only, sincronizacao manual)
+- `GET /integrations/mercadolivre/orders` (pedidos sincronizados localmente)
+  - inclui status logistico (etiqueta/impresso/em transito/entregue), tipo de frete e itens do pedido
+  - inclui campos financeiros estimados: faturado, recebido bruto/liquido, taxas ML, estornos e ajustes de frete
+
+## Integracao Mercado Livre (OAuth)
+Variaveis de ambiente necessarias no backend:
+- `ML_APP_ID`
+- `ML_CLIENT_SECRET`
+- `ML_REDIRECT_URI`
+
+Fluxo:
+1. Chamar `POST /integrations/mercadolivre/connect` para obter `authorize_url`.
+2. Redirecionar o usuario para o `authorize_url`.
+3. Configurar o callback da aplicacao para `GET /integrations/mercadolivre/callback`.
+4. Consultar `GET /integrations/mercadolivre/status` para acompanhar contas conectadas e refresh de token.
 
 ## Notas de calculo no POST /quotes
 - Recebe `units_produced` (default 1)

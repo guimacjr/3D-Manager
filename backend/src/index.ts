@@ -1,5 +1,6 @@
 import path from "node:path";
 import { createReadStream } from "node:fs";
+import fs from "node:fs";
 import { stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import cors from "@fastify/cors";
@@ -9,16 +10,95 @@ import { v4 as uuidv4 } from "uuid";
 import { ZodError, z } from "zod";
 import { createDb, nowIso, runMigrations } from "./db.js";
 import { ensureMediaStorage, persistMediaFile, persistUploadedBuffer } from "./media-store.js";
-import { computeQuote } from "./pricing.js";
+import { computeContributionMargin, computeQuote } from "./pricing.js";
+import {
+  MercadoLivreApiError,
+  buildMercadoLivreAuthorizationUrl,
+  computeTokenExpiresAtIso,
+  exchangeMercadoLivreAuthorizationCode,
+  fetchMercadoLivreItems,
+  fetchMercadoLivreItemPricing,
+  fetchMercadoLivreItemVariations,
+  fetchMercadoLivreListingFeeEstimate,
+  fetchMercadoLivreOrderBillingDetail,
+  fetchMercadoLivreOrderDetail,
+  fetchMercadoLivrePaymentDetail,
+  fetchMercadoLivreSellerOrders,
+  fetchMercadoLivreSellerItemIds,
+  fetchMercadoLivreShipmentCosts,
+  fetchMercadoLivreShipmentDetail,
+  fetchMercadoLivreUser,
+  getMercadoLivreConfig,
+  isTokenExpiringSoon,
+  refreshMercadoLivreAccessToken,
+} from "./marketplace-ml.js";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const backendRoot = path.resolve(path.dirname(currentFilePath), "..");
+const envFilePath = path.resolve(backendRoot, ".env");
+
+function loadEnvFile(filePath: string): void {
+  if (!fs.existsSync(filePath)) return;
+  const content = fs.readFileSync(filePath, "utf8");
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const eqIndex = line.indexOf("=");
+    if (eqIndex <= 0) continue;
+
+    const key = line.slice(0, eqIndex).trim();
+    if (!key || Object.prototype.hasOwnProperty.call(process.env, key)) continue;
+
+    const value = line.slice(eqIndex + 1).trim();
+    process.env[key] = value;
+  }
+}
+
+loadEnvFile(envFilePath);
+
 const dbPath = process.env.DB_PATH ?? path.resolve(backendRoot, "data.sqlite");
 const migrationsDir = path.resolve(backendRoot, "migrations");
 const mediaRoot = process.env.MEDIA_ROOT ?? path.resolve(backendRoot, "storage", "media");
 
 const db = createDb(dbPath);
 runMigrations(db, migrationsDir);
+
+function ensureMarketplaceCatalogVariationColumns() {
+  const columns = db
+    .prepare("PRAGMA table_info('marketplace_catalog_variations')")
+    .all() as Array<{ name?: string }>;
+  const names = new Set(columns.map((column) => String(column.name ?? "")));
+
+  if (!names.has("linked_sku_id")) {
+    db.prepare("ALTER TABLE marketplace_catalog_variations ADD COLUMN linked_sku_id TEXT").run();
+  }
+
+  if (!names.has("is_ignored")) {
+    db.prepare(
+      "ALTER TABLE marketplace_catalog_variations ADD COLUMN is_ignored INTEGER NOT NULL DEFAULT 0 CHECK (is_ignored IN (0,1))"
+    ).run();
+  }
+
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_marketplace_catalog_variations_ignored
+      ON marketplace_catalog_variations (account_id, is_ignored, updated_at DESC)`
+  ).run();
+}
+
+function ensureMarketplaceCatalogItemColumns() {
+  const columns = db
+    .prepare("PRAGMA table_info('marketplace_catalog_items')")
+    .all() as Array<{ name?: string }>;
+  const names = new Set(columns.map((column) => String(column.name ?? "")));
+
+  if (!names.has("category_id")) {
+    db.prepare("ALTER TABLE marketplace_catalog_items ADD COLUMN category_id TEXT").run();
+  }
+}
+
+ensureMarketplaceCatalogItemColumns();
+ensureMarketplaceCatalogVariationColumns();
 ensureMediaStorage(mediaRoot);
 
 const app = Fastify({ logger: true });
@@ -192,6 +272,68 @@ const consignmentReturnSchema = z.object({
   notes: z.string().optional().default(""),
 });
 
+const mercadoLivreConnectSchema = z.object({
+  account_label: z.string().optional().default(""),
+});
+
+const mercadoLivreCallbackQuerySchema = z.object({
+  code: z.string().min(1),
+  state: z.string().min(1),
+});
+
+const mercadoLivreDisconnectSchema = z.object({
+  account_id: z.string().optional().or(z.literal("")),
+});
+
+const mercadoLivreCatalogSyncSchema = z.object({
+  account_id: z.string().optional().or(z.literal("")),
+  limit: z.number().int().positive().max(1000).optional().default(200),
+});
+
+const mercadoLivreCatalogListQuerySchema = z.object({
+  account_id: z.string().optional().or(z.literal("")),
+  q: z.string().optional().or(z.literal("")),
+  limit: z.coerce.number().int().positive().max(500).optional().default(100),
+});
+
+const mercadoLivreCatalogVariationsListQuerySchema = z.object({
+  account_id: z.string().optional().or(z.literal("")),
+  q: z.string().optional().or(z.literal("")),
+  item_id: z.string().optional().or(z.literal("")),
+  limit: z.coerce.number().int().positive().max(500).optional().default(100),
+});
+
+const mercadoLivreCatalogVariationLinkSkuSchema = z.object({
+  variation_id: z.string().min(1),
+  sku_id: z.string().optional().or(z.literal("")),
+});
+
+const mercadoLivreCatalogVariationIgnoreSchema = z.object({
+  variation_id: z.string().min(1),
+  is_ignored: z.boolean().optional().default(true),
+});
+
+const mercadoLivreOrdersSyncSchema = z.object({
+  account_id: z.string().optional().or(z.literal("")),
+  limit: z.number().int().positive().max(1000).optional().default(200),
+});
+
+const mercadoLivreOrdersListQuerySchema = z.object({
+  account_id: z.string().optional().or(z.literal("")),
+  status: z.string().optional().or(z.literal("")),
+  q: z.string().optional().or(z.literal("")),
+  limit: z.coerce.number().int().positive().max(500).optional().default(100),
+});
+
+const mercadoLivreCustomRequestSchema = z.object({
+  account_id: z.string().optional().or(z.literal("")),
+  method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).optional().default("GET"),
+  path: z.string().min(1),
+  query: z.record(z.string(), z.string()).optional().default({}),
+  headers: z.record(z.string(), z.string()).optional().default({}),
+  body: z.string().optional().default(""),
+});
+
 function readMultipartFieldValue(
   fields: Record<string, unknown> | undefined,
   fieldName: string
@@ -330,25 +472,6 @@ function computeSuggestedSalesPrices(params: {
     suggested_wholesale_cash_price_cents: Math.round(
       baseCost * (1 + params.markups.markup_wholesale_cash_bps / 10000)
     ),
-  };
-}
-
-function computeContributionMargin(params: {
-  revenueCents: number;
-  variableCostCents: number;
-  taxCents: number;
-}): {
-  contribution_margin_cents: number;
-  contribution_margin_bps: number;
-} {
-  const revenue = Math.max(0, Math.round(Number(params.revenueCents || 0)));
-  const variableCost = Math.max(0, Math.round(Number(params.variableCostCents || 0)));
-  const tax = Math.max(0, Math.round(Number(params.taxCents || 0)));
-  const contribution = revenue - variableCost - tax;
-  const bps = revenue > 0 ? Math.round((contribution * 10000) / revenue) : 0;
-  return {
-    contribution_margin_cents: contribution,
-    contribution_margin_bps: bps,
   };
 }
 
@@ -636,7 +759,1842 @@ function appendOperationLog(params: {
   );
 }
 
+type MarketplaceAccountRow = {
+  id: string;
+  marketplace: string;
+  account_label: string | null;
+  marketplace_user_id: string;
+  seller_nickname: string | null;
+  country_id: string | null;
+  access_token: string | null;
+  refresh_token: string | null;
+  token_expires_at: string | null;
+  scope: string | null;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
+  last_connected_at: string;
+  last_token_refresh_at: string | null;
+};
+
+function toMarketplaceAccountResponse(account: MarketplaceAccountRow) {
+  const nowMs = Date.now();
+  const expiresAtMs = Date.parse(account.token_expires_at ?? "");
+  const tokenValid = Number.isFinite(expiresAtMs) && expiresAtMs > nowMs;
+
+  return {
+    id: account.id,
+    marketplace: account.marketplace,
+    account_label: account.account_label,
+    marketplace_user_id: account.marketplace_user_id,
+    seller_nickname: account.seller_nickname,
+    country_id: account.country_id,
+    scope: account.scope,
+    is_active: account.is_active === 1,
+    token_expires_at: account.token_expires_at,
+    token_status: tokenValid ? (isTokenExpiringSoon(account.token_expires_at, 180) ? "expiring_soon" : "valid") : "expired",
+    created_at: account.created_at,
+    updated_at: account.updated_at,
+    last_connected_at: account.last_connected_at,
+    last_token_refresh_at: account.last_token_refresh_at,
+  };
+}
+
+async function refreshMercadoLivreAccountToken(accountId: string): Promise<MarketplaceAccountRow | null> {
+  const account = db
+    .prepare(
+      `SELECT id, marketplace, account_label, marketplace_user_id, seller_nickname, country_id,
+              access_token, refresh_token, token_expires_at, scope, is_active, created_at, updated_at,
+              last_connected_at, last_token_refresh_at
+       FROM marketplace_accounts
+       WHERE id = ?
+         AND marketplace = 'mercadolivre'
+         AND is_active = 1`
+    )
+    .get(accountId) as MarketplaceAccountRow | undefined;
+
+  if (!account || !account.refresh_token) return account ?? null;
+
+  const token = await refreshMercadoLivreAccessToken(account.refresh_token);
+  const now = nowIso();
+  const nextExpiresAt = computeTokenExpiresAtIso(token.expires_in);
+  const nextRefreshToken = token.refresh_token || account.refresh_token;
+  const nextScope = token.scope ?? account.scope;
+
+  db.prepare(
+    `UPDATE marketplace_accounts
+     SET access_token = ?, refresh_token = ?, token_expires_at = ?, scope = ?,
+         updated_at = ?, last_token_refresh_at = ?
+     WHERE id = ?`
+  ).run(token.access_token, nextRefreshToken, nextExpiresAt, nextScope ?? null, now, now, accountId);
+
+  return db
+    .prepare(
+      `SELECT id, marketplace, account_label, marketplace_user_id, seller_nickname, country_id,
+              access_token, refresh_token, token_expires_at, scope, is_active, created_at, updated_at,
+              last_connected_at, last_token_refresh_at
+       FROM marketplace_accounts
+       WHERE id = ?`
+    )
+    .get(accountId) as MarketplaceAccountRow | undefined ?? null;
+}
+
+function resolveMercadoLivreAccount(accountId?: string | null): MarketplaceAccountRow | null {
+  const trimmedAccountId = (accountId ?? "").trim();
+  const row = trimmedAccountId
+    ? db
+        .prepare(
+          `SELECT id, marketplace, account_label, marketplace_user_id, seller_nickname, country_id,
+                  access_token, refresh_token, token_expires_at, scope, is_active, created_at, updated_at,
+                  last_connected_at, last_token_refresh_at
+           FROM marketplace_accounts
+           WHERE id = ?
+             AND marketplace = 'mercadolivre'
+             AND is_active = 1`
+        )
+        .get(trimmedAccountId)
+    : db
+        .prepare(
+          `SELECT id, marketplace, account_label, marketplace_user_id, seller_nickname, country_id,
+                  access_token, refresh_token, token_expires_at, scope, is_active, created_at, updated_at,
+                  last_connected_at, last_token_refresh_at
+           FROM marketplace_accounts
+           WHERE marketplace = 'mercadolivre'
+             AND is_active = 1
+           ORDER BY updated_at DESC
+           LIMIT 1`
+        )
+        .get();
+
+  return (row as MarketplaceAccountRow | undefined) ?? null;
+}
+
+function parsePriceToCents(value: number | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  return Math.round(value * 100);
+}
+
+function parseSignedPriceToCents(value: number | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.round(value * 100);
+}
+
+function deriveEffectiveVariationPriceCents(params: {
+  variationPriceCents: number | null;
+  itemPriceCents: number | null;
+  itemBasePriceCents: number | null;
+  itemPromotionPriceCents: number | null;
+  itemEffectivePriceCents: number | null;
+}): number | null {
+  const {
+    variationPriceCents,
+    itemPriceCents,
+    itemBasePriceCents,
+    itemPromotionPriceCents,
+    itemEffectivePriceCents,
+  } = params;
+
+  const promoOrEffectiveItemPriceCents = itemPromotionPriceCents ?? itemEffectivePriceCents;
+  const fallbackItemPriceCents = promoOrEffectiveItemPriceCents ?? itemPriceCents;
+
+  if (variationPriceCents === null) {
+    return fallbackItemPriceCents;
+  }
+
+  if (promoOrEffectiveItemPriceCents === null) {
+    return variationPriceCents;
+  }
+
+  const referenceBaseCents = itemBasePriceCents ?? itemPriceCents;
+  if (
+    typeof referenceBaseCents === "number" &&
+    referenceBaseCents > 0 &&
+    promoOrEffectiveItemPriceCents >= 0 &&
+    promoOrEffectiveItemPriceCents < referenceBaseCents
+  ) {
+    const discountRatio = promoOrEffectiveItemPriceCents / referenceBaseCents;
+    return Math.max(0, Math.round(variationPriceCents * discountRatio));
+  }
+
+  return Math.min(variationPriceCents, promoOrEffectiveItemPriceCents);
+}
+
+function sumNumber(values: Array<number | null | undefined>): number {
+  return values.reduce((sum, value) => sum + (typeof value === "number" && Number.isFinite(value) ? value : 0), 0);
+}
+
+function resolveEstimatedSellingFeeCents(params: {
+  saleFeeCents: number | null;
+  listingFeeCents: number | null;
+  saleFeeGrossCents: number | null;
+  saleFeeFixedCents: number | null;
+}): number {
+  if (params.saleFeeGrossCents !== null) return Math.max(0, params.saleFeeGrossCents);
+  if (params.saleFeeCents !== null && params.saleFeeFixedCents !== null) {
+    return Math.max(0, params.saleFeeCents) + Math.max(0, params.saleFeeFixedCents);
+  }
+  if (params.saleFeeCents !== null) return Math.max(0, params.saleFeeCents);
+  if (params.listingFeeCents !== null) return Math.max(0, params.listingFeeCents);
+  return 0;
+}
+
+function getLinkedSkuBillableWeightGrams(params: {
+  accountId: string;
+  marketplaceItemId: string;
+  variationKey: string;
+}): number | undefined {
+  const row = db
+    .prepare(
+      `SELECT s.id AS sku_id,
+              q.units_produced AS units_produced,
+              COALESCE(SUM(qf.used_weight_grams), 0) AS total_used_weight_grams
+       FROM marketplace_catalog_variations v
+       LEFT JOIN sales_skus s ON s.id = v.linked_sku_id
+       LEFT JOIN print_quotes q ON q.id = s.source_quote_id
+       LEFT JOIN print_quote_filaments qf ON qf.quote_id = q.id
+       WHERE v.account_id = ?
+         AND v.marketplace_item_id = ?
+         AND v.variation_key = ?
+       GROUP BY s.id, q.units_produced`
+    )
+    .get(params.accountId, params.marketplaceItemId, params.variationKey) as
+    | {
+        sku_id?: string | null;
+        units_produced?: number | null;
+        total_used_weight_grams?: number | null;
+      }
+    | undefined;
+
+  if (!row?.sku_id) return undefined;
+
+  const unitsProduced = Math.max(1, Math.round(Number(row.units_produced ?? 1)));
+  const totalUsedWeightGrams = Math.max(0, Number(row.total_used_weight_grams ?? 0));
+  if (!Number.isFinite(totalUsedWeightGrams) || totalUsedWeightGrams <= 0) return undefined;
+
+  const unitWeight = totalUsedWeightGrams / unitsProduced;
+  if (!Number.isFinite(unitWeight) || unitWeight <= 0) return undefined;
+
+  return Math.max(1, Math.round(unitWeight));
+}
+
+function deriveShippingStage(params: {
+  status?: string | null;
+  substatus?: string | null;
+}): string | null {
+  const status = (params.status ?? "").toLowerCase();
+  const substatus = (params.substatus ?? "").toLowerCase();
+
+  if (status === "ready_to_ship") {
+    if (substatus.includes("printed")) return "label_printed";
+    if (substatus.includes("print")) return "label_to_print";
+    return "ready_to_ship";
+  }
+  if (status === "shipped") return "in_transit";
+  if (status === "delivered") return "delivered";
+  if (status) return status;
+  return null;
+}
+
+async function recomputeMercadoLivreVariationFeeEstimate(variationId: string): Promise<void> {
+  const row = db
+    .prepare(
+      `SELECT v.id, v.account_id, v.marketplace_item_id, v.variation_key, v.price_cents, v.effective_price_cents,
+              COALESCE(v.currency_id, i.currency_id) AS currency_id,
+              i.site_id, i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id
+       FROM marketplace_catalog_variations v
+       LEFT JOIN marketplace_catalog_items i
+         ON i.account_id = v.account_id
+        AND i.marketplace_item_id = v.marketplace_item_id
+       WHERE v.id = ?
+         AND v.marketplace = 'mercadolivre'`
+    )
+    .get(variationId) as
+    | {
+        id: string;
+        account_id: string;
+        marketplace_item_id: string;
+        variation_key: string;
+        price_cents: number | null;
+        effective_price_cents: number | null;
+        currency_id: string | null;
+        site_id: string | null;
+        listing_type_id: string | null;
+        category_id: string | null;
+      }
+    | undefined;
+
+  if (!row || !row.site_id) return;
+
+  const priceForFeesCents = row.effective_price_cents ?? row.price_cents;
+  if (!priceForFeesCents || priceForFeesCents <= 0) return;
+
+  let account = resolveMercadoLivreAccount(row.account_id);
+  if (!account) return;
+  if (isTokenExpiringSoon(account.token_expires_at, 180)) {
+    const refreshed = await refreshMercadoLivreAccountToken(account.id);
+    if (refreshed) account = refreshed;
+  }
+  if (!account.access_token) return;
+
+  const feeEstimate = await fetchMercadoLivreListingFeeEstimate({
+    accessToken: account.access_token,
+    siteId: row.site_id,
+    price: priceForFeesCents / 100,
+    listingTypeId: row.listing_type_id ?? undefined,
+    categoryId: row.category_id ?? undefined,
+    currencyId: row.currency_id ?? undefined,
+    shippingMode: "me2",
+    logisticType: "self_service",
+    billableWeight: getLinkedSkuBillableWeightGrams({
+      accountId: row.account_id,
+      marketplaceItemId: row.marketplace_item_id,
+      variationKey: row.variation_key,
+    }),
+  }).catch(() => null);
+
+  if (!feeEstimate) return;
+
+  const estimatedSaleFeeCents = parsePriceToCents(feeEstimate.saleFeeAmount);
+  const estimatedListingFeeCents = parsePriceToCents(feeEstimate.listingFeeAmount);
+  const estimatedSaleFeeGrossCents = parsePriceToCents(feeEstimate.saleFeeGrossAmount);
+  const estimatedSaleFeeFixedCents = parsePriceToCents(feeEstimate.saleFeeFixedAmount);
+  const estimatedSellingFeeCents = resolveEstimatedSellingFeeCents({
+    saleFeeCents: estimatedSaleFeeCents,
+    listingFeeCents: estimatedListingFeeCents,
+    saleFeeGrossCents: estimatedSaleFeeGrossCents,
+    saleFeeFixedCents: estimatedSaleFeeFixedCents,
+  });
+  const estimatedNetProceedsCents = Math.max(0, priceForFeesCents - estimatedSellingFeeCents);
+  const now = nowIso();
+
+  db.prepare(
+    `UPDATE marketplace_catalog_variations
+     SET estimated_sale_fee_cents = ?,
+         estimated_listing_fee_cents = ?,
+         estimated_net_proceeds_cents = ?,
+         updated_at = ?
+     WHERE id = ?`
+  ).run(estimatedSaleFeeCents, estimatedListingFeeCents, estimatedNetProceedsCents, now, variationId);
+}
+
 app.get("/health", async () => ({ ok: true }));
+
+app.post("/integrations/mercadolivre/connect", async (request, reply) => {
+  if (!getMercadoLivreConfig()) {
+    reply.code(503);
+    return {
+      message: "Mercado Livre OAuth não configurado no backend. Defina ML_APP_ID, ML_CLIENT_SECRET e ML_REDIRECT_URI.",
+    };
+  }
+
+  const body = mercadoLivreConnectSchema.parse(request.body ?? {});
+  const state = uuidv4().replace(/-/g, "");
+  const now = nowIso();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+  db.prepare(
+    `INSERT INTO marketplace_oauth_states (
+      id, marketplace, state, created_at, expires_at, consumed_at
+    ) VALUES (?, 'mercadolivre', ?, ?, ?, NULL)`
+  ).run(uuidv4(), state, now, expiresAt);
+
+  if (body.account_label.trim()) {
+    appendOperationLog({
+      eventType: "marketplace_connect_started",
+      entityType: "marketplace_account",
+      entityId: null,
+      summary: "Conexão Mercado Livre iniciada",
+      payload: {
+        marketplace: "mercadolivre",
+        account_label: body.account_label.trim(),
+        state,
+      },
+    });
+  }
+
+  return {
+    marketplace: "mercadolivre",
+    authorize_url: buildMercadoLivreAuthorizationUrl(state),
+    state,
+    expires_at: expiresAt,
+  };
+});
+
+app.get("/integrations/mercadolivre/callback", async (request, reply) => {
+  const query = mercadoLivreCallbackQuerySchema.parse(request.query ?? {});
+  const now = nowIso();
+
+  const stateRow = db
+    .prepare(
+      `SELECT id, state, expires_at
+       FROM marketplace_oauth_states
+       WHERE marketplace = 'mercadolivre'
+         AND state = ?
+         AND consumed_at IS NULL`
+    )
+    .get(query.state) as { id: string; state: string; expires_at: string } | undefined;
+
+  if (!stateRow) {
+    reply.code(400);
+    return { message: "State OAuth inválido ou já utilizado." };
+  }
+
+  if (Date.parse(stateRow.expires_at) < Date.now()) {
+    reply.code(400);
+    return { message: "State OAuth expirado. Gere uma nova conexão." };
+  }
+
+  try {
+    const token = await exchangeMercadoLivreAuthorizationCode(query.code);
+    const user = await fetchMercadoLivreUser(token.access_token);
+    const accountId = uuidv4();
+    const expiresAt = computeTokenExpiresAtIso(token.expires_in);
+    const metadataJson = JSON.stringify({ site_id: user.site_id ?? null });
+
+    const tx = db.transaction(() => {
+      db.prepare("UPDATE marketplace_oauth_states SET consumed_at = ? WHERE id = ?").run(now, stateRow.id);
+
+      db.prepare(
+        `INSERT INTO marketplace_accounts (
+          id, marketplace, account_label, marketplace_user_id, seller_nickname, country_id,
+          access_token, refresh_token, token_expires_at, scope, is_active, metadata_json,
+          created_at, updated_at, last_connected_at, last_token_refresh_at
+        ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+        ON CONFLICT(marketplace, marketplace_user_id) DO UPDATE SET
+          seller_nickname = excluded.seller_nickname,
+          country_id = excluded.country_id,
+          access_token = excluded.access_token,
+          refresh_token = excluded.refresh_token,
+          token_expires_at = excluded.token_expires_at,
+          scope = excluded.scope,
+          is_active = 1,
+          metadata_json = excluded.metadata_json,
+          updated_at = excluded.updated_at,
+          last_connected_at = excluded.last_connected_at,
+          last_token_refresh_at = excluded.last_token_refresh_at`
+      ).run(
+        accountId,
+        null,
+        String(user.id),
+        user.nickname ?? null,
+        user.country_id ?? null,
+        token.access_token,
+        token.refresh_token,
+        expiresAt,
+        token.scope ?? null,
+        metadataJson,
+        now,
+        now,
+        now,
+        now
+      );
+    });
+
+    tx();
+
+    const account = db
+      .prepare(
+        `SELECT id, marketplace, account_label, marketplace_user_id, seller_nickname, country_id,
+                access_token, refresh_token, token_expires_at, scope, is_active, created_at, updated_at,
+                last_connected_at, last_token_refresh_at
+         FROM marketplace_accounts
+         WHERE marketplace = 'mercadolivre'
+           AND marketplace_user_id = ?`
+      )
+      .get(String(user.id)) as MarketplaceAccountRow | undefined;
+
+    appendOperationLog({
+      eventType: "marketplace_connected",
+      entityType: "marketplace_account",
+      entityId: account?.id,
+      summary: "Conta Mercado Livre conectada",
+      payload: {
+        marketplace: "mercadolivre",
+        marketplace_user_id: String(user.id),
+        seller_nickname: user.nickname ?? null,
+        country_id: user.country_id ?? null,
+      },
+    });
+
+    return {
+      ok: true,
+      marketplace: "mercadolivre",
+      account: account ? toMarketplaceAccountResponse(account) : null,
+    };
+  } catch (error: unknown) {
+    if (error instanceof MercadoLivreApiError) {
+      reply.code(502);
+      return {
+        message: "Falha ao concluir OAuth com Mercado Livre.",
+        marketplace_error_status: error.statusCode,
+        marketplace_error: error.details,
+      };
+    }
+    throw error;
+  }
+});
+
+app.get("/integrations/mercadolivre/status", async (_request, reply) => {
+  const config = getMercadoLivreConfig();
+  const rows = db
+    .prepare(
+      `SELECT id, marketplace, account_label, marketplace_user_id, seller_nickname, country_id,
+              access_token, refresh_token, token_expires_at, scope, is_active, created_at, updated_at,
+              last_connected_at, last_token_refresh_at
+       FROM marketplace_accounts
+       WHERE marketplace = 'mercadolivre'
+         AND is_active = 1
+       ORDER BY updated_at DESC`
+    )
+    .all() as MarketplaceAccountRow[];
+
+  const accounts = [] as ReturnType<typeof toMarketplaceAccountResponse>[];
+  const refreshErrors = [] as Array<{ account_id: string; message: string; status?: number; details?: unknown }>;
+
+  for (const row of rows) {
+    let account = row;
+    const shouldRefresh = !!config && isTokenExpiringSoon(account.token_expires_at, 180);
+
+    if (shouldRefresh) {
+      try {
+        const refreshed = await refreshMercadoLivreAccountToken(account.id);
+        if (refreshed) {
+          account = refreshed;
+        }
+      } catch (error: unknown) {
+        if (error instanceof MercadoLivreApiError) {
+          refreshErrors.push({
+            account_id: account.id,
+            message: "Falha ao atualizar token com Mercado Livre.",
+            status: error.statusCode,
+            details: error.details,
+          });
+        } else {
+          refreshErrors.push({
+            account_id: account.id,
+            message: "Falha inesperada ao atualizar token.",
+          });
+        }
+      }
+    }
+
+    accounts.push(toMarketplaceAccountResponse(account));
+  }
+
+  if (refreshErrors.length > 0) {
+    reply.code(207);
+  }
+
+  return {
+    marketplace: "mercadolivre",
+    configured: Boolean(config),
+    connected: accounts.length > 0,
+    accounts,
+    refresh_errors: refreshErrors,
+  };
+});
+
+app.post("/integrations/mercadolivre/disconnect", async (request, reply) => {
+  const body = mercadoLivreDisconnectSchema.parse(request.body ?? {});
+  const now = nowIso();
+
+  const result = body.account_id && body.account_id.trim()
+    ? db
+        .prepare(
+          `UPDATE marketplace_accounts
+           SET is_active = 0,
+               access_token = NULL,
+               refresh_token = NULL,
+               token_expires_at = NULL,
+               updated_at = ?
+           WHERE id = ?
+             AND marketplace = 'mercadolivre'
+             AND is_active = 1`
+        )
+        .run(now, body.account_id.trim())
+    : db
+        .prepare(
+          `UPDATE marketplace_accounts
+           SET is_active = 0,
+               access_token = NULL,
+               refresh_token = NULL,
+               token_expires_at = NULL,
+               updated_at = ?
+           WHERE marketplace = 'mercadolivre'
+             AND is_active = 1`
+        )
+        .run(now);
+
+  if (result.changes === 0) {
+    reply.code(404);
+    return { message: "Nenhuma conta Mercado Livre ativa encontrada para desconectar." };
+  }
+
+  appendOperationLog({
+    eventType: "marketplace_disconnected",
+    entityType: "marketplace_account",
+    entityId: body.account_id?.trim() || null,
+    summary: "Conta Mercado Livre desconectada",
+    payload: {
+      marketplace: "mercadolivre",
+      account_id: body.account_id?.trim() || null,
+      deactivated_accounts: result.changes,
+    },
+  });
+
+  return {
+    ok: true,
+    marketplace: "mercadolivre",
+    deactivated_accounts: result.changes,
+  };
+});
+
+app.post("/integrations/mercadolivre/custom-request", async (request, reply) => {
+  const body = mercadoLivreCustomRequestSchema.parse(request.body ?? {});
+  const requestedAccountId = body.account_id?.trim() || undefined;
+  const account = resolveMercadoLivreAccount(requestedAccountId);
+
+  if (!account) {
+    reply.code(404);
+    return { message: "Conta Mercado Livre ativa não encontrada." };
+  }
+
+  let activeAccount = account;
+  if (isTokenExpiringSoon(activeAccount.token_expires_at, 180)) {
+    const refreshed = await refreshMercadoLivreAccountToken(activeAccount.id);
+    if (refreshed) {
+      activeAccount = refreshed;
+    }
+  }
+
+  if (!activeAccount.access_token) {
+    reply.code(409);
+    return { message: "Conta Mercado Livre sem access_token ativo." };
+  }
+
+  const rawPath = body.path.trim();
+  const normalizedPath = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  if (normalizedPath.includes("://")) {
+    reply.code(400);
+    return { message: "Informe apenas path relativo da API (ex.: /orders/123)." };
+  }
+
+  const url = new URL(`https://api.mercadolibre.com${normalizedPath}`);
+  for (const [key, value] of Object.entries(body.query ?? {})) {
+    const k = key.trim();
+    if (!k) continue;
+    url.searchParams.set(k, value);
+  }
+
+  const method = body.method;
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${activeAccount.access_token}`,
+    accept: "application/json",
+  };
+
+  for (const [key, value] of Object.entries(body.headers ?? {})) {
+    const headerName = key.trim().toLowerCase();
+    if (!headerName) continue;
+    if (headerName === "authorization" || headerName === "host" || headerName === "content-length") continue;
+    headers[headerName] = value;
+  }
+
+  let payload: string | undefined;
+  if (method !== "GET" && method !== "DELETE" && body.body.trim()) {
+    payload = body.body;
+    headers["content-type"] = "application/json";
+  }
+
+  const mlResponse = await fetch(url.toString(), {
+    method,
+    headers,
+    body: payload,
+  });
+
+  const responseHeaders = Object.fromEntries(
+    Array.from(mlResponse.headers.entries()).filter(([key]) => {
+      const k = key.toLowerCase();
+      return (
+        k === "content-type" ||
+        k === "x-request-id" ||
+        k === "x-correlation-id" ||
+        k.startsWith("x-ratelimit")
+      );
+    })
+  );
+
+  const contentType = mlResponse.headers.get("content-type") ?? "";
+  const data = contentType.includes("application/json")
+    ? await mlResponse.json().catch(() => null)
+    : await mlResponse.text().catch(() => "");
+
+  return {
+    marketplace: "mercadolivre",
+    account_id: activeAccount.id,
+    method,
+    url: url.toString(),
+    status: mlResponse.status,
+    ok: mlResponse.ok,
+    headers: responseHeaders,
+    data,
+  };
+});
+
+app.post("/integrations/mercadolivre/sync/catalog", async (request, reply) => {
+  const body = mercadoLivreCatalogSyncSchema.parse(request.body ?? {});
+  const requestedAccountId = body.account_id?.trim() || undefined;
+  const account = resolveMercadoLivreAccount(requestedAccountId);
+
+  if (!account) {
+    reply.code(404);
+    return { message: "Conta Mercado Livre ativa não encontrada." };
+  }
+
+  const runId = uuidv4();
+  const startedAt = nowIso();
+  db.prepare(
+    `INSERT INTO marketplace_sync_runs (
+      id, marketplace, account_id, sync_type, status, started_at, finished_at,
+      records_read, records_upserted, records_failed, error_message, created_at, updated_at
+    ) VALUES (?, 'mercadolivre', ?, 'catalog_read', 'running', ?, NULL, 0, 0, 0, NULL, ?, ?)`
+  ).run(runId, account.id, startedAt, startedAt, startedAt);
+
+  let recordsRead = 0;
+  let recordsUpserted = 0;
+  let recordsFailed = 0;
+
+  try {
+    let activeAccount = account;
+    if (isTokenExpiringSoon(activeAccount.token_expires_at, 180)) {
+      const refreshed = await refreshMercadoLivreAccountToken(activeAccount.id);
+      if (refreshed) {
+        activeAccount = refreshed;
+      }
+    }
+
+    if (!activeAccount.access_token) {
+      throw new Error("Conta Mercado Livre sem access_token ativo.");
+    }
+
+    let offset = 0;
+    let remaining = Math.max(1, body.limit);
+    let totalKnown = Number.MAX_SAFE_INTEGER;
+
+    const upsertItemStmt = db.prepare(
+      `INSERT INTO marketplace_catalog_items (
+        id, marketplace, account_id, marketplace_item_id, seller_id, title, status, condition, permalink,
+        thumbnail, currency_id, listing_type_id, category_id, price_cents, base_price_cents, promotion_price_cents,
+        effective_price_cents, effective_currency_id, estimated_sale_fee_cents, estimated_listing_fee_cents,
+        estimated_net_proceeds_cents, estimated_fee_currency_id, promotion_id, promotion_type,
+        available_quantity, sold_quantity, site_id, raw_json, last_seen_at, created_at, updated_at
+      ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, marketplace_item_id) DO UPDATE SET
+        seller_id = excluded.seller_id,
+        title = excluded.title,
+        status = excluded.status,
+        condition = excluded.condition,
+        permalink = excluded.permalink,
+        thumbnail = excluded.thumbnail,
+        currency_id = excluded.currency_id,
+        listing_type_id = excluded.listing_type_id,
+        category_id = excluded.category_id,
+        price_cents = excluded.price_cents,
+        base_price_cents = excluded.base_price_cents,
+        promotion_price_cents = excluded.promotion_price_cents,
+        effective_price_cents = excluded.effective_price_cents,
+        effective_currency_id = excluded.effective_currency_id,
+        estimated_sale_fee_cents = excluded.estimated_sale_fee_cents,
+        estimated_listing_fee_cents = excluded.estimated_listing_fee_cents,
+        estimated_net_proceeds_cents = excluded.estimated_net_proceeds_cents,
+        estimated_fee_currency_id = excluded.estimated_fee_currency_id,
+        promotion_id = excluded.promotion_id,
+        promotion_type = excluded.promotion_type,
+        available_quantity = excluded.available_quantity,
+        sold_quantity = excluded.sold_quantity,
+        site_id = excluded.site_id,
+        raw_json = excluded.raw_json,
+        last_seen_at = excluded.last_seen_at,
+        updated_at = excluded.updated_at`
+    );
+
+    const upsertVariationStmt = db.prepare(
+      `INSERT INTO marketplace_catalog_variations (
+        id, marketplace, account_id, marketplace_item_id, marketplace_variation_id, variation_key,
+        title, variation_label, attribute_combinations_json, status, currency_id, price_cents,
+        effective_price_cents, estimated_sale_fee_cents, estimated_listing_fee_cents,
+        estimated_net_proceeds_cents, available_quantity, sold_quantity, raw_json,
+        last_seen_at, created_at, updated_at
+      ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, marketplace_item_id, variation_key) DO UPDATE SET
+        marketplace_variation_id = excluded.marketplace_variation_id,
+        title = excluded.title,
+        variation_label = excluded.variation_label,
+        attribute_combinations_json = excluded.attribute_combinations_json,
+        status = excluded.status,
+        currency_id = excluded.currency_id,
+        price_cents = excluded.price_cents,
+        effective_price_cents = excluded.effective_price_cents,
+        estimated_sale_fee_cents = excluded.estimated_sale_fee_cents,
+        estimated_listing_fee_cents = excluded.estimated_listing_fee_cents,
+        estimated_net_proceeds_cents = excluded.estimated_net_proceeds_cents,
+        available_quantity = excluded.available_quantity,
+        sold_quantity = excluded.sold_quantity,
+        raw_json = excluded.raw_json,
+        last_seen_at = excluded.last_seen_at,
+        updated_at = excluded.updated_at`
+    );
+
+    while (remaining > 0 && offset < totalKnown) {
+      const pageSize = Math.min(50, remaining);
+      const page = await fetchMercadoLivreSellerItemIds({
+        accessToken: activeAccount.access_token,
+        sellerId: activeAccount.marketplace_user_id,
+        offset,
+        limit: pageSize,
+      });
+
+      totalKnown = Math.min(totalKnown, Math.max(0, page.total));
+      if (!page.itemIds.length) break;
+
+      recordsRead += page.itemIds.length;
+      const snapshots = await fetchMercadoLivreItems({
+        accessToken: activeAccount.access_token,
+        itemIds: page.itemIds,
+      });
+
+      const now = nowIso();
+      for (const item of snapshots) {
+        try {
+          const pricing = await fetchMercadoLivreItemPricing({
+            accessToken: activeAccount.access_token,
+            itemId: item.id,
+          }).catch(() => null);
+
+          const basePriceCents = parsePriceToCents(pricing?.baseAmount);
+          const promotionPriceCents = parsePriceToCents(pricing?.promotionAmount);
+          const effectivePriceCents = parsePriceToCents(pricing?.effectiveAmount);
+          const itemPriceCents = parsePriceToCents(item.price);
+          const effectiveItemPriceForFeesCents = effectivePriceCents ?? promotionPriceCents ?? itemPriceCents;
+          const itemBillableWeightGrams = getLinkedSkuBillableWeightGrams({
+            accountId: activeAccount.id,
+            marketplaceItemId: item.id,
+            variationKey: "__item__",
+          });
+
+          const feeEstimate =
+            item.siteId && effectiveItemPriceForFeesCents !== null && effectiveItemPriceForFeesCents > 0
+              ? await fetchMercadoLivreListingFeeEstimate({
+                  accessToken: activeAccount.access_token,
+                  siteId: item.siteId,
+                  price: effectiveItemPriceForFeesCents / 100,
+                  listingTypeId: item.listingTypeId,
+                  categoryId: item.categoryId,
+                  currencyId: pricing?.currencyId ?? item.currencyId,
+                  shippingMode: "me2",
+                  logisticType: "self_service",
+                  billableWeight: itemBillableWeightGrams,
+                }).catch(() => null)
+              : null;
+
+          const estimatedSaleFeeCents = parsePriceToCents(feeEstimate?.saleFeeAmount);
+          const estimatedListingFeeCents = parsePriceToCents(feeEstimate?.listingFeeAmount);
+          const estimatedSaleFeeGrossCents = parsePriceToCents(feeEstimate?.saleFeeGrossAmount);
+          const estimatedSaleFeeFixedCents = parsePriceToCents(feeEstimate?.saleFeeFixedAmount);
+          const estimatedSellingFeeCents = resolveEstimatedSellingFeeCents({
+            saleFeeCents: estimatedSaleFeeCents,
+            listingFeeCents: estimatedListingFeeCents,
+            saleFeeGrossCents: estimatedSaleFeeGrossCents,
+            saleFeeFixedCents: estimatedSaleFeeFixedCents,
+          });
+          const estimatedNetProceedsCents =
+            effectiveItemPriceForFeesCents !== null
+              ? Math.max(
+                  0,
+                  effectiveItemPriceForFeesCents -
+                    estimatedSellingFeeCents
+                )
+              : null;
+
+          upsertItemStmt.run(
+            `${activeAccount.id}:${item.id}`,
+            activeAccount.id,
+            item.id,
+            item.sellerId ?? activeAccount.marketplace_user_id,
+            item.title,
+            item.status ?? null,
+            item.condition ?? null,
+            item.permalink ?? null,
+            item.thumbnail ?? null,
+            item.currencyId ?? null,
+            item.listingTypeId ?? null,
+            item.categoryId ?? null,
+            itemPriceCents,
+            basePriceCents,
+            promotionPriceCents,
+            effectiveItemPriceForFeesCents,
+            pricing?.currencyId ?? null,
+            estimatedSaleFeeCents,
+            estimatedListingFeeCents,
+            estimatedNetProceedsCents,
+            feeEstimate?.currencyId ?? null,
+            pricing?.promotionId ?? null,
+            pricing?.promotionType ?? null,
+            item.availableQuantity ?? null,
+            item.soldQuantity ?? null,
+            item.siteId ?? null,
+            JSON.stringify(item.raw),
+            now,
+            now,
+            now
+          );
+
+          const variations = await fetchMercadoLivreItemVariations({
+            accessToken: activeAccount.access_token,
+            itemId: item.id,
+          }).catch(() => []);
+
+          const upsertVariation = async (params: {
+            variationId?: string;
+            variationKey: string;
+            variationLabel?: string;
+            attributesJson?: string | null;
+            priceCents: number | null;
+            effectivePriceCents: number | null;
+            availableQuantity: number | null;
+            soldQuantity: number | null;
+            rawJson: string;
+          }) => {
+            const priceForFeesCents = params.effectivePriceCents ?? params.priceCents;
+            const feeEstimate =
+              item.siteId && priceForFeesCents !== null && priceForFeesCents > 0
+                ? await fetchMercadoLivreListingFeeEstimate({
+                    accessToken: activeAccount.access_token,
+                    siteId: item.siteId,
+                    price: priceForFeesCents / 100,
+                    listingTypeId: item.listingTypeId,
+                    categoryId: item.categoryId,
+                    currencyId: pricing?.currencyId ?? item.currencyId,
+                    shippingMode: "me2",
+                    logisticType: "self_service",
+                    billableWeight: getLinkedSkuBillableWeightGrams({
+                      accountId: activeAccount.id,
+                      marketplaceItemId: item.id,
+                      variationKey: params.variationKey,
+                    }),
+                  }).catch(() => null)
+                : null;
+
+            const estimatedSaleFeeCents = parsePriceToCents(feeEstimate?.saleFeeAmount);
+            const estimatedListingFeeCents = parsePriceToCents(feeEstimate?.listingFeeAmount);
+            const estimatedSaleFeeGrossCents = parsePriceToCents(feeEstimate?.saleFeeGrossAmount);
+            const estimatedSaleFeeFixedCents = parsePriceToCents(feeEstimate?.saleFeeFixedAmount);
+            const estimatedSellingFeeCents = resolveEstimatedSellingFeeCents({
+              saleFeeCents: estimatedSaleFeeCents,
+              listingFeeCents: estimatedListingFeeCents,
+              saleFeeGrossCents: estimatedSaleFeeGrossCents,
+              saleFeeFixedCents: estimatedSaleFeeFixedCents,
+            });
+            const estimatedNetProceedsCents =
+              priceForFeesCents !== null
+                ? Math.max(
+                    0,
+                    priceForFeesCents -
+                      estimatedSellingFeeCents
+                  )
+                : null;
+
+            upsertVariationStmt.run(
+              `${activeAccount.id}:${item.id}:${params.variationKey}`,
+              activeAccount.id,
+              item.id,
+              params.variationId ?? null,
+              params.variationKey,
+              item.title,
+              params.variationLabel ?? null,
+              params.attributesJson ?? null,
+              item.status ?? null,
+              pricing?.currencyId ?? item.currencyId ?? null,
+              params.priceCents,
+              params.effectivePriceCents,
+              estimatedSaleFeeCents,
+              estimatedListingFeeCents,
+              estimatedNetProceedsCents,
+              params.availableQuantity,
+              params.soldQuantity,
+              params.rawJson,
+              now,
+              now,
+              now
+            );
+          };
+
+          if (variations.length > 0) {
+            for (const variation of variations) {
+              const priceCents = parsePriceToCents(variation.price);
+              const effectiveVariationCents = deriveEffectiveVariationPriceCents({
+                variationPriceCents: priceCents,
+                itemPriceCents,
+                itemBasePriceCents: basePriceCents,
+                itemPromotionPriceCents: promotionPriceCents,
+                itemEffectivePriceCents: effectiveItemPriceForFeesCents,
+              });
+              await upsertVariation({
+                variationId: variation.id,
+                variationKey: variation.key,
+                variationLabel: variation.label,
+                attributesJson: JSON.stringify(variation.attributes),
+                priceCents,
+                effectivePriceCents: effectiveVariationCents,
+                availableQuantity: variation.availableQuantity ?? null,
+                soldQuantity: variation.soldQuantity ?? null,
+                rawJson: JSON.stringify(variation.raw),
+              });
+            }
+          } else {
+            await upsertVariation({
+              variationId: undefined,
+              variationKey: "__item__",
+              variationLabel: "Anúncio principal",
+              attributesJson: JSON.stringify([]),
+              priceCents: itemPriceCents,
+              effectivePriceCents: effectiveItemPriceForFeesCents,
+              availableQuantity: item.availableQuantity ?? null,
+              soldQuantity: item.soldQuantity ?? null,
+              rawJson: JSON.stringify(item.raw),
+            });
+          }
+
+          recordsUpserted += 1;
+        } catch (error: any) {
+          recordsFailed += 1;
+          db.prepare(
+            `INSERT INTO marketplace_sync_errors (
+              id, run_id, account_id, marketplace, error_code, error_message, payload_json, created_at
+            ) VALUES (?, ?, ?, 'mercadolivre', ?, ?, ?, ?)`
+          ).run(
+            uuidv4(),
+            runId,
+            activeAccount.id,
+            "item_upsert_failed",
+            String(error?.message ?? "Failed to upsert marketplace item"),
+            JSON.stringify({ marketplace_item_id: item.id }),
+            nowIso()
+          );
+        }
+      }
+
+      const missingCount = Math.max(0, page.itemIds.length - snapshots.length);
+      if (missingCount > 0) {
+        recordsFailed += missingCount;
+      }
+
+      offset += page.itemIds.length;
+      remaining -= page.itemIds.length;
+    }
+
+    const finishedAt = nowIso();
+    db.prepare(
+      `UPDATE marketplace_sync_runs
+       SET status = 'success',
+           finished_at = ?,
+           records_read = ?,
+           records_upserted = ?,
+           records_failed = ?,
+           updated_at = ?
+       WHERE id = ?`
+    ).run(finishedAt, recordsRead, recordsUpserted, recordsFailed, finishedAt, runId);
+
+    appendOperationLog({
+      eventType: "marketplace_catalog_synced",
+      entityType: "marketplace_account",
+      entityId: activeAccount.id,
+      summary: "Sincronização read-only do catálogo Mercado Livre concluída",
+      payload: {
+        marketplace: "mercadolivre",
+        account_id: activeAccount.id,
+        records_read: recordsRead,
+        records_upserted: recordsUpserted,
+        records_failed: recordsFailed,
+      },
+    });
+
+    return {
+      ok: true,
+      run_id: runId,
+      account_id: activeAccount.id,
+      marketplace: "mercadolivre",
+      records_read: recordsRead,
+      records_upserted: recordsUpserted,
+      records_failed: recordsFailed,
+    };
+  } catch (error: unknown) {
+    const finishedAt = nowIso();
+    const message =
+      error instanceof MercadoLivreApiError
+        ? `Mercado Livre API error (${error.statusCode})`
+        : (error as any)?.message ?? "Falha ao sincronizar catálogo";
+
+    db.prepare(
+      `UPDATE marketplace_sync_runs
+       SET status = 'error',
+           finished_at = ?,
+           records_read = ?,
+           records_upserted = ?,
+           records_failed = ?,
+           error_message = ?,
+           updated_at = ?
+       WHERE id = ?`
+    ).run(finishedAt, recordsRead, recordsUpserted, recordsFailed, message, finishedAt, runId);
+
+    db.prepare(
+      `INSERT INTO marketplace_sync_errors (
+        id, run_id, account_id, marketplace, error_code, error_message, payload_json, created_at
+      ) VALUES (?, ?, ?, 'mercadolivre', ?, ?, ?, ?)`
+    ).run(
+      uuidv4(),
+      runId,
+      account.id,
+      error instanceof MercadoLivreApiError ? `ml_api_${error.statusCode}` : "sync_failed",
+      message,
+      JSON.stringify(
+        error instanceof MercadoLivreApiError
+          ? { details: error.details }
+          : { error: String((error as any)?.message ?? error) }
+      ),
+      finishedAt
+    );
+
+    reply.code(error instanceof MercadoLivreApiError ? 502 : 500);
+    return {
+      message,
+      run_id: runId,
+      marketplace_error:
+        error instanceof MercadoLivreApiError
+          ? {
+              status: error.statusCode,
+              details: error.details,
+            }
+          : undefined,
+    };
+  }
+});
+
+app.get("/integrations/mercadolivre/catalog", async (request) => {
+  const query = mercadoLivreCatalogListQuerySchema.parse(request.query ?? {});
+  const accountId = query.account_id?.trim() || null;
+  const likeValue = `%${(query.q ?? "").trim()}%`;
+
+  const rows = accountId
+    ? db
+        .prepare(
+          `SELECT i.id, i.account_id, i.marketplace_item_id, i.seller_id, i.title, i.status, i.condition,
+                  i.permalink, i.thumbnail, i.currency_id, i.listing_type_id, i.price_cents,
+                  i.base_price_cents, i.promotion_price_cents, i.effective_price_cents, i.effective_currency_id,
+                  i.estimated_sale_fee_cents, i.estimated_listing_fee_cents, i.estimated_net_proceeds_cents,
+                  i.estimated_fee_currency_id, i.promotion_id, i.promotion_type,
+                  i.available_quantity, i.sold_quantity, i.site_id, i.last_seen_at, i.updated_at
+           FROM marketplace_catalog_items i
+           WHERE i.marketplace = 'mercadolivre'
+             AND i.account_id = ?
+             AND (? = '%%' OR i.title LIKE ? OR i.marketplace_item_id LIKE ?)
+           ORDER BY i.updated_at DESC
+           LIMIT ?`
+        )
+        .all(accountId, likeValue, likeValue, likeValue, query.limit)
+    : db
+        .prepare(
+          `SELECT i.id, i.account_id, i.marketplace_item_id, i.seller_id, i.title, i.status, i.condition,
+                  i.permalink, i.thumbnail, i.currency_id, i.listing_type_id, i.price_cents,
+                  i.base_price_cents, i.promotion_price_cents, i.effective_price_cents, i.effective_currency_id,
+                  i.estimated_sale_fee_cents, i.estimated_listing_fee_cents, i.estimated_net_proceeds_cents,
+                  i.estimated_fee_currency_id, i.promotion_id, i.promotion_type,
+                  i.available_quantity, i.sold_quantity, i.site_id, i.last_seen_at, i.updated_at
+           FROM marketplace_catalog_items i
+           WHERE i.marketplace = 'mercadolivre'
+             AND (? = '%%' OR i.title LIKE ? OR i.marketplace_item_id LIKE ?)
+           ORDER BY i.updated_at DESC
+           LIMIT ?`
+        )
+        .all(likeValue, likeValue, likeValue, query.limit);
+
+  return rows;
+});
+
+app.get("/integrations/mercadolivre/catalog/variations", async (request) => {
+  const query = mercadoLivreCatalogVariationsListQuerySchema.parse(request.query ?? {});
+  const accountId = query.account_id?.trim() || null;
+  const itemId = query.item_id?.trim() || null;
+  const likeValue = `%${(query.q ?? "").trim()}%`;
+
+  const rows = accountId
+    ? db
+        .prepare(
+          `SELECT v.id, v.account_id, v.marketplace_item_id, v.marketplace_variation_id, v.variation_key,
+                  v.title, v.variation_label, v.status, v.currency_id, v.price_cents, v.effective_price_cents,
+                  v.estimated_sale_fee_cents, v.estimated_listing_fee_cents, v.estimated_net_proceeds_cents,
+                  v.available_quantity, v.sold_quantity, v.last_seen_at, v.updated_at, v.is_ignored,
+                  i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+                  v.linked_sku_id, s.sku_code AS linked_sku_code, s.name AS linked_sku_name, s.is_active AS linked_sku_is_active
+           FROM marketplace_catalog_variations v
+           LEFT JOIN marketplace_catalog_items i
+             ON i.account_id = v.account_id
+            AND i.marketplace_item_id = v.marketplace_item_id
+           LEFT JOIN sales_skus s ON s.id = v.linked_sku_id
+           WHERE v.marketplace = 'mercadolivre'
+             AND v.account_id = ?
+             AND (? IS NULL OR v.marketplace_item_id = ?)
+             AND (? = '%%' OR v.title LIKE ? OR COALESCE(v.variation_label, '') LIKE ? OR v.marketplace_item_id LIKE ?)
+           ORDER BY v.updated_at DESC
+           LIMIT ?`
+        )
+        .all(accountId, itemId, itemId, likeValue, likeValue, likeValue, likeValue, query.limit)
+    : db
+        .prepare(
+          `SELECT v.id, v.account_id, v.marketplace_item_id, v.marketplace_variation_id, v.variation_key,
+                  v.title, v.variation_label, v.status, v.currency_id, v.price_cents, v.effective_price_cents,
+                  v.estimated_sale_fee_cents, v.estimated_listing_fee_cents, v.estimated_net_proceeds_cents,
+                  v.available_quantity, v.sold_quantity, v.last_seen_at, v.updated_at, v.is_ignored,
+                  i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+                  v.linked_sku_id, s.sku_code AS linked_sku_code, s.name AS linked_sku_name, s.is_active AS linked_sku_is_active
+           FROM marketplace_catalog_variations v
+           LEFT JOIN marketplace_catalog_items i
+             ON i.account_id = v.account_id
+            AND i.marketplace_item_id = v.marketplace_item_id
+           LEFT JOIN sales_skus s ON s.id = v.linked_sku_id
+           WHERE v.marketplace = 'mercadolivre'
+             AND (? IS NULL OR v.marketplace_item_id = ?)
+             AND (? = '%%' OR v.title LIKE ? OR COALESCE(v.variation_label, '') LIKE ? OR v.marketplace_item_id LIKE ?)
+           ORDER BY v.updated_at DESC
+           LIMIT ?`
+        )
+        .all(itemId, itemId, likeValue, likeValue, likeValue, likeValue, query.limit);
+
+  return rows;
+});
+
+app.post("/integrations/mercadolivre/catalog/variations/link-sku", async (request, reply) => {
+  const body = mercadoLivreCatalogVariationLinkSkuSchema.parse(request.body ?? {});
+  const variationId = body.variation_id.trim();
+  const requestedSkuId = body.sku_id?.trim() || null;
+
+  const variation = db
+    .prepare(
+      `SELECT id
+       FROM marketplace_catalog_variations
+       WHERE marketplace = 'mercadolivre'
+         AND id = ?`
+    )
+    .get(variationId) as { id: string } | undefined;
+
+  if (!variation) {
+    reply.code(404);
+    return { message: "Anúncio/variação local não encontrado." };
+  }
+
+  if (requestedSkuId) {
+    const sku = db
+      .prepare("SELECT id FROM sales_skus WHERE id = ?")
+      .get(requestedSkuId) as { id: string } | undefined;
+    if (!sku) {
+      reply.code(404);
+      return { message: "SKU informado não encontrado." };
+    }
+  }
+
+  const now = nowIso();
+  db.prepare(
+    `UPDATE marketplace_catalog_variations
+     SET linked_sku_id = ?, updated_at = ?
+     WHERE id = ?`
+  ).run(requestedSkuId, now, variationId);
+
+  await recomputeMercadoLivreVariationFeeEstimate(variationId);
+
+  const row = db
+    .prepare(
+      `SELECT v.id, v.account_id, v.marketplace_item_id, v.marketplace_variation_id, v.variation_key,
+              v.title, v.variation_label, v.status, v.currency_id, v.price_cents, v.effective_price_cents,
+              v.estimated_sale_fee_cents, v.estimated_listing_fee_cents, v.estimated_net_proceeds_cents,
+              v.available_quantity, v.sold_quantity, v.last_seen_at, v.updated_at, v.is_ignored,
+              i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+              v.linked_sku_id, s.sku_code AS linked_sku_code, s.name AS linked_sku_name, s.is_active AS linked_sku_is_active
+       FROM marketplace_catalog_variations v
+       LEFT JOIN marketplace_catalog_items i
+         ON i.account_id = v.account_id
+        AND i.marketplace_item_id = v.marketplace_item_id
+       LEFT JOIN sales_skus s ON s.id = v.linked_sku_id
+       WHERE v.id = ?`
+    )
+    .get(variationId);
+
+  appendOperationLog({
+    eventType: "marketplace_listing_sku_link_updated",
+    entityType: "marketplace_listing",
+    entityId: variationId,
+    summary: requestedSkuId
+      ? "Vínculo de anúncio com SKU local atualizado"
+      : "Vínculo de anúncio com SKU local removido",
+    payload: {
+      marketplace: "mercadolivre",
+      variation_id: variationId,
+      linked_sku_id: requestedSkuId,
+    },
+  });
+
+  return {
+    ok: true,
+    variation: row,
+  };
+});
+
+app.post("/integrations/mercadolivre/catalog/variations/ignore", async (request, reply) => {
+  const body = mercadoLivreCatalogVariationIgnoreSchema.parse(request.body ?? {});
+  const variationId = body.variation_id.trim();
+  const isIgnored = body.is_ignored ? 1 : 0;
+
+  const variation = db
+    .prepare(
+      `SELECT id
+       FROM marketplace_catalog_variations
+       WHERE marketplace = 'mercadolivre'
+         AND id = ?`
+    )
+    .get(variationId) as { id: string } | undefined;
+
+  if (!variation) {
+    reply.code(404);
+    return { message: "Anúncio/variação local não encontrado." };
+  }
+
+  const now = nowIso();
+  db.prepare(
+    `UPDATE marketplace_catalog_variations
+     SET is_ignored = ?, updated_at = ?
+     WHERE id = ?`
+  ).run(isIgnored, now, variationId);
+
+  const row = db
+    .prepare(
+      `SELECT v.id, v.account_id, v.marketplace_item_id, v.marketplace_variation_id, v.variation_key,
+              v.title, v.variation_label, v.status, v.currency_id, v.price_cents, v.effective_price_cents,
+              v.estimated_sale_fee_cents, v.estimated_listing_fee_cents, v.estimated_net_proceeds_cents,
+              v.available_quantity, v.sold_quantity, v.last_seen_at, v.updated_at, v.is_ignored,
+              i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+              v.linked_sku_id, s.sku_code AS linked_sku_code, s.name AS linked_sku_name, s.is_active AS linked_sku_is_active
+       FROM marketplace_catalog_variations v
+       LEFT JOIN marketplace_catalog_items i
+         ON i.account_id = v.account_id
+        AND i.marketplace_item_id = v.marketplace_item_id
+       LEFT JOIN sales_skus s ON s.id = v.linked_sku_id
+       WHERE v.id = ?`
+    )
+    .get(variationId);
+
+  appendOperationLog({
+    eventType: "marketplace_listing_ignore_updated",
+    entityType: "marketplace_listing",
+    entityId: variationId,
+    summary: isIgnored === 1 ? "Anúncio ignorado" : "Anúncio removido da lista de ignorados",
+    payload: {
+      marketplace: "mercadolivre",
+      variation_id: variationId,
+      is_ignored: isIgnored === 1,
+    },
+  });
+
+  return {
+    ok: true,
+    variation: row,
+  };
+});
+
+app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
+  const body = mercadoLivreOrdersSyncSchema.parse(request.body ?? {});
+  const requestedAccountId = body.account_id?.trim() || undefined;
+  const account = resolveMercadoLivreAccount(requestedAccountId);
+
+  if (!account) {
+    reply.code(404);
+    return { message: "Conta Mercado Livre ativa não encontrada." };
+  }
+
+  const runId = uuidv4();
+  const startedAt = nowIso();
+  db.prepare(
+    `INSERT INTO marketplace_sync_runs (
+      id, marketplace, account_id, sync_type, status, started_at, finished_at,
+      records_read, records_upserted, records_failed, error_message, created_at, updated_at
+    ) VALUES (?, 'mercadolivre', ?, 'orders_read', 'running', ?, NULL, 0, 0, 0, NULL, ?, ?)`
+  ).run(runId, account.id, startedAt, startedAt, startedAt);
+
+  let recordsRead = 0;
+  let recordsUpserted = 0;
+  let recordsFailed = 0;
+
+  try {
+    let activeAccount = account;
+    if (isTokenExpiringSoon(activeAccount.token_expires_at, 180)) {
+      const refreshed = await refreshMercadoLivreAccountToken(activeAccount.id);
+      if (refreshed) {
+        activeAccount = refreshed;
+      }
+    }
+
+    if (!activeAccount.access_token) {
+      throw new Error("Conta Mercado Livre sem access_token ativo.");
+    }
+
+    const upsertOrderStmt = db.prepare(
+      `INSERT INTO marketplace_orders (
+        id, marketplace, account_id, marketplace_order_id, seller_id, buyer_id, buyer_nickname, status,
+        substatus, order_total_cents, paid_amount_cents, currency_id, shipping_id, shipping_status,
+        shipping_substatus, shipping_mode, shipping_logistic_type, shipping_type, shipping_tracking_number,
+        shipping_stage, billed_total_cents, gross_received_cents, net_received_cents, ml_fee_total_cents,
+        refunds_total_cents, shipping_cost_cents, shipping_compensation_cents,
+        date_created, date_closed, raw_json, last_seen_at, created_at, updated_at
+      ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, marketplace_order_id) DO UPDATE SET
+        seller_id = excluded.seller_id,
+        buyer_id = excluded.buyer_id,
+        buyer_nickname = excluded.buyer_nickname,
+        status = excluded.status,
+        substatus = excluded.substatus,
+        order_total_cents = excluded.order_total_cents,
+        paid_amount_cents = excluded.paid_amount_cents,
+        currency_id = excluded.currency_id,
+        shipping_id = excluded.shipping_id,
+        shipping_status = excluded.shipping_status,
+        shipping_substatus = excluded.shipping_substatus,
+        shipping_mode = excluded.shipping_mode,
+        shipping_logistic_type = excluded.shipping_logistic_type,
+        shipping_type = excluded.shipping_type,
+        shipping_tracking_number = excluded.shipping_tracking_number,
+        shipping_stage = excluded.shipping_stage,
+        billed_total_cents = excluded.billed_total_cents,
+        gross_received_cents = excluded.gross_received_cents,
+        net_received_cents = excluded.net_received_cents,
+        ml_fee_total_cents = excluded.ml_fee_total_cents,
+        refunds_total_cents = excluded.refunds_total_cents,
+        shipping_cost_cents = excluded.shipping_cost_cents,
+        shipping_compensation_cents = excluded.shipping_compensation_cents,
+        date_created = excluded.date_created,
+        date_closed = excluded.date_closed,
+        raw_json = excluded.raw_json,
+        last_seen_at = excluded.last_seen_at,
+        updated_at = excluded.updated_at`
+    );
+
+    const upsertOrderItemStmt = db.prepare(
+      `INSERT INTO marketplace_order_items (
+        id, marketplace, account_id, order_id, marketplace_order_id, marketplace_item_id,
+        marketplace_variation_id, variation_key, title, quantity, unit_price_cents, total_price_cents,
+        currency_id, linked_catalog_variation_id, linked_catalog_variation_label, raw_json, created_at, updated_at
+      ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(order_id, marketplace_item_id, variation_key) DO UPDATE SET
+        marketplace_variation_id = excluded.marketplace_variation_id,
+        title = excluded.title,
+        quantity = excluded.quantity,
+        unit_price_cents = excluded.unit_price_cents,
+        total_price_cents = excluded.total_price_cents,
+        currency_id = excluded.currency_id,
+        linked_catalog_variation_id = excluded.linked_catalog_variation_id,
+        linked_catalog_variation_label = excluded.linked_catalog_variation_label,
+        raw_json = excluded.raw_json,
+        updated_at = excluded.updated_at`
+    );
+
+    let offset = 0;
+    let remaining = Math.max(1, body.limit);
+    let totalKnown = Number.MAX_SAFE_INTEGER;
+
+    while (remaining > 0 && offset < totalKnown) {
+      const pageSize = Math.min(50, remaining);
+      const page = await fetchMercadoLivreSellerOrders({
+        accessToken: activeAccount.access_token,
+        sellerId: activeAccount.marketplace_user_id,
+        offset,
+        limit: pageSize,
+      });
+
+      totalKnown = Math.min(totalKnown, Math.max(0, page.total));
+      if (!page.orders.length) break;
+
+      recordsRead += page.orders.length;
+
+      const now = nowIso();
+      for (const order of page.orders) {
+        try {
+          const detail = await fetchMercadoLivreOrderDetail({
+            accessToken: activeAccount.access_token,
+            orderId: order.id,
+          }).catch(() => null);
+
+          const effectiveOrder = detail?.order ?? order;
+          const orderItems = detail?.items ?? [];
+          const paymentIds = detail?.paymentIds ?? [];
+
+          const shipmentDetail =
+            effectiveOrder.shippingId
+              ? await fetchMercadoLivreShipmentDetail({
+                  accessToken: activeAccount.access_token,
+                  shipmentId: effectiveOrder.shippingId,
+                }).catch(() => null)
+              : null;
+
+          const shipmentCosts =
+            effectiveOrder.shippingId
+              ? await fetchMercadoLivreShipmentCosts({
+                  accessToken: activeAccount.access_token,
+                  shipmentId: effectiveOrder.shippingId,
+                }).catch(() => null)
+              : null;
+
+          const billingDetail = await fetchMercadoLivreOrderBillingDetail({
+            accessToken: activeAccount.access_token,
+            orderId: effectiveOrder.id,
+          }).catch(() => null);
+
+          const paymentDetails = [] as Array<{
+            grossReceivedCents: number | null;
+            netReceivedCents: number | null;
+            mlFeeTotalCents: number | null;
+            refundsTotalCents: number | null;
+          }>;
+
+          for (const paymentId of paymentIds) {
+            const payment = await fetchMercadoLivrePaymentDetail({
+              accessToken: activeAccount.access_token,
+              paymentId,
+            }).catch(() => null);
+            paymentDetails.push({
+              grossReceivedCents: parsePriceToCents(payment?.grossReceived),
+              netReceivedCents: parsePriceToCents(payment?.netReceived),
+              mlFeeTotalCents: parseSignedPriceToCents(payment?.mlFeeTotal),
+              refundsTotalCents: parsePriceToCents(payment?.refundsTotal),
+            });
+          }
+
+          const grossReceivedCents = sumNumber(paymentDetails.map((item) => item.grossReceivedCents));
+          const netReceivedCentsBase = sumNumber(paymentDetails.map((item) => item.netReceivedCents));
+          const netReceivedCount = paymentDetails.filter((item) => (item.netReceivedCents ?? 0) > 0).length;
+          const mlFeeTotalCentsFromPayments = sumNumber(paymentDetails.map((item) => item.mlFeeTotalCents));
+          const mlFeeTotalCentsFromBilling =
+            parseSignedPriceToCents(billingDetail?.saleFeeGross) ??
+            parseSignedPriceToCents(billingDetail?.saleFeeNet) ??
+            0;
+          const mlFeeTotalCents =
+            Math.abs(mlFeeTotalCentsFromPayments) > 0 ? mlFeeTotalCentsFromPayments : mlFeeTotalCentsFromBilling;
+          const refundsTotalCentsFromPayments = sumNumber(paymentDetails.map((item) => item.refundsTotalCents));
+          const refundsTotalCentsFromBilling =
+            (parsePriceToCents(billingDetail?.saleFeeRebate) ?? 0) +
+            (parsePriceToCents(billingDetail?.saleFeeDiscount) ?? 0);
+          const refundsTotalCents =
+            refundsTotalCentsFromPayments > 0 ? refundsTotalCentsFromPayments : refundsTotalCentsFromBilling;
+          const shippingCostCentsFromShipment = parsePriceToCents(shipmentCosts?.shippingCost) ?? 0;
+          const shippingCompensationCentsFromShipment = parsePriceToCents(shipmentCosts?.shippingCompensation) ?? 0;
+          const shippingCostCentsFromBilling = parsePriceToCents(billingDetail?.shippingCost) ?? 0;
+          const shippingCompensationCentsFromBilling = parsePriceToCents(billingDetail?.shippingCompensation) ?? 0;
+          const shippingCostCents =
+            shippingCostCentsFromShipment > 0 ? shippingCostCentsFromShipment : shippingCostCentsFromBilling;
+          const shippingCompensationCents =
+            shippingCompensationCentsFromShipment > 0
+              ? shippingCompensationCentsFromShipment
+              : shippingCompensationCentsFromBilling;
+
+          const billedTotalCents =
+            parsePriceToCents(billingDetail?.billedTotal) ??
+            parsePriceToCents(effectiveOrder.totalAmount);
+          const grossFallbackCents =
+            grossReceivedCents > 0
+              ? grossReceivedCents
+              : parsePriceToCents(effectiveOrder.paidAmount) ??
+                parsePriceToCents(billingDetail?.billedTotal) ??
+                0;
+          const hasMlFeeSignals = Math.abs(mlFeeTotalCents) > 0;
+          const hasOtherCostSignals =
+            refundsTotalCents > 0 ||
+            shippingCostCents > 0 ||
+            shippingCompensationCents > 0;
+          const billingNetAmountCents = parsePriceToCents(billingDetail?.netAmount);
+          const hasPaymentEvidence =
+            paymentIds.length > 0 ||
+            paymentDetails.some(
+              (item) =>
+                item.grossReceivedCents !== null ||
+                item.netReceivedCents !== null ||
+                item.mlFeeTotalCents !== null ||
+                item.refundsTotalCents !== null
+            ) ||
+            grossFallbackCents > 0 ||
+            (parsePriceToCents(effectiveOrder.paidAmount) ?? 0) > 0;
+          const netFinalCents =
+            billingNetAmountCents !== null
+              ? Math.max(0, billingNetAmountCents)
+              : netReceivedCount > 0
+              ? Math.max(0, netReceivedCentsBase)
+              : grossFallbackCents > 0 && hasMlFeeSignals
+                ? Math.max(0, grossFallbackCents - mlFeeTotalCents + Math.max(0, refundsTotalCents))
+                : grossFallbackCents > 0 && hasOtherCostSignals
+                ? Math.max(
+                    0,
+                    grossFallbackCents -
+                      refundsTotalCents -
+                      shippingCostCents +
+                      shippingCompensationCents
+                  )
+                : grossFallbackCents > 0 && hasPaymentEvidence
+                  ? grossFallbackCents
+                : null;
+
+          upsertOrderStmt.run(
+            `${activeAccount.id}:${effectiveOrder.id}`,
+            activeAccount.id,
+            effectiveOrder.id,
+            effectiveOrder.sellerId,
+            effectiveOrder.buyerId ?? null,
+            effectiveOrder.buyerNickname ?? null,
+            effectiveOrder.status ?? null,
+            effectiveOrder.substatus ?? null,
+            parsePriceToCents(effectiveOrder.totalAmount),
+            parsePriceToCents(effectiveOrder.paidAmount),
+            effectiveOrder.currencyId ?? null,
+            effectiveOrder.shippingId ?? null,
+            shipmentDetail?.status ?? effectiveOrder.shippingStatus ?? null,
+            shipmentDetail?.substatus ?? null,
+            shipmentDetail?.mode ?? null,
+            shipmentDetail?.logisticType ?? null,
+            shipmentDetail?.shippingType ?? null,
+            shipmentDetail?.trackingNumber ?? null,
+            deriveShippingStage({
+              status: shipmentDetail?.status ?? effectiveOrder.shippingStatus,
+              substatus: shipmentDetail?.substatus,
+            }),
+            billedTotalCents ?? null,
+            grossFallbackCents || null,
+            netFinalCents,
+            mlFeeTotalCents || null,
+            refundsTotalCents || null,
+            shippingCostCents || null,
+            shippingCompensationCents || null,
+            effectiveOrder.dateCreated ?? null,
+            effectiveOrder.dateClosed ?? null,
+            JSON.stringify(effectiveOrder.raw),
+            now,
+            now,
+            now
+          );
+
+          const orderRowId = `${activeAccount.id}:${effectiveOrder.id}`;
+          db.prepare("DELETE FROM marketplace_order_items WHERE order_id = ?").run(orderRowId);
+          for (const item of orderItems) {
+            const variationKey = item.marketplaceVariationId ? `var:${item.marketplaceVariationId}` : "__item__";
+            const linkedVariation = db
+              .prepare(
+                `SELECT id, variation_label
+                 FROM marketplace_catalog_variations
+                 WHERE account_id = ?
+                   AND marketplace_item_id = ?
+                   AND variation_key = ?
+                 LIMIT 1`
+              )
+              .get(activeAccount.id, item.marketplaceItemId, variationKey) as
+              | { id: string; variation_label: string | null }
+              | undefined;
+
+            upsertOrderItemStmt.run(
+              `${orderRowId}:${item.marketplaceItemId}:${variationKey}`,
+              activeAccount.id,
+              orderRowId,
+              effectiveOrder.id,
+              item.marketplaceItemId,
+              item.marketplaceVariationId ?? null,
+              variationKey,
+              item.title,
+              Math.max(1, Math.round(item.quantity)),
+              parsePriceToCents(item.unitPrice),
+              parsePriceToCents(item.totalPrice),
+              item.currencyId ?? effectiveOrder.currencyId ?? null,
+              linkedVariation?.id ?? null,
+              linkedVariation?.variation_label ?? null,
+              JSON.stringify(item.raw),
+              now,
+              now
+            );
+          }
+
+          recordsUpserted += 1;
+        } catch (error: any) {
+          recordsFailed += 1;
+          db.prepare(
+            `INSERT INTO marketplace_sync_errors (
+              id, run_id, account_id, marketplace, error_code, error_message, payload_json, created_at
+            ) VALUES (?, ?, ?, 'mercadolivre', ?, ?, ?, ?)`
+          ).run(
+            uuidv4(),
+            runId,
+            activeAccount.id,
+            "order_upsert_failed",
+            String(error?.message ?? "Failed to upsert marketplace order"),
+            JSON.stringify({ marketplace_order_id: order.id }),
+            nowIso()
+          );
+        }
+      }
+
+      offset += page.orders.length;
+      remaining -= page.orders.length;
+    }
+
+    const finishedAt = nowIso();
+    db.prepare(
+      `UPDATE marketplace_sync_runs
+       SET status = 'success',
+           finished_at = ?,
+           records_read = ?,
+           records_upserted = ?,
+           records_failed = ?,
+           updated_at = ?
+       WHERE id = ?`
+    ).run(finishedAt, recordsRead, recordsUpserted, recordsFailed, finishedAt, runId);
+
+    appendOperationLog({
+      eventType: "marketplace_orders_synced",
+      entityType: "marketplace_account",
+      entityId: activeAccount.id,
+      summary: "Sincronização read-only de pedidos Mercado Livre concluída",
+      payload: {
+        marketplace: "mercadolivre",
+        account_id: activeAccount.id,
+        records_read: recordsRead,
+        records_upserted: recordsUpserted,
+        records_failed: recordsFailed,
+      },
+    });
+
+    return {
+      ok: true,
+      run_id: runId,
+      account_id: activeAccount.id,
+      marketplace: "mercadolivre",
+      records_read: recordsRead,
+      records_upserted: recordsUpserted,
+      records_failed: recordsFailed,
+    };
+  } catch (error: unknown) {
+    const finishedAt = nowIso();
+    const message =
+      error instanceof MercadoLivreApiError
+        ? `Mercado Livre API error (${error.statusCode})`
+        : (error as any)?.message ?? "Falha ao sincronizar pedidos";
+
+    db.prepare(
+      `UPDATE marketplace_sync_runs
+       SET status = 'error',
+           finished_at = ?,
+           records_read = ?,
+           records_upserted = ?,
+           records_failed = ?,
+           error_message = ?,
+           updated_at = ?
+       WHERE id = ?`
+    ).run(finishedAt, recordsRead, recordsUpserted, recordsFailed, message, finishedAt, runId);
+
+    db.prepare(
+      `INSERT INTO marketplace_sync_errors (
+        id, run_id, account_id, marketplace, error_code, error_message, payload_json, created_at
+      ) VALUES (?, ?, ?, 'mercadolivre', ?, ?, ?, ?)`
+    ).run(
+      uuidv4(),
+      runId,
+      account.id,
+      error instanceof MercadoLivreApiError ? `ml_api_${error.statusCode}` : "sync_failed",
+      message,
+      JSON.stringify(
+        error instanceof MercadoLivreApiError
+          ? { details: error.details }
+          : { error: String((error as any)?.message ?? error) }
+      ),
+      finishedAt
+    );
+
+    reply.code(error instanceof MercadoLivreApiError ? 502 : 500);
+    return {
+      message,
+      run_id: runId,
+      marketplace_error:
+        error instanceof MercadoLivreApiError
+          ? {
+              status: error.statusCode,
+              details: error.details,
+            }
+          : undefined,
+    };
+  }
+});
+
+app.get("/integrations/mercadolivre/orders", async (request) => {
+  const query = mercadoLivreOrdersListQuerySchema.parse(request.query ?? {});
+  const accountId = query.account_id?.trim() || null;
+  const status = query.status?.trim() || null;
+  const likeValue = `%${(query.q ?? "").trim()}%`;
+
+  const rows = accountId
+    ? db
+        .prepare(
+          `SELECT o.id, o.account_id, o.marketplace_order_id, o.seller_id, o.buyer_id, o.buyer_nickname,
+                  o.status, o.substatus, o.order_total_cents, o.paid_amount_cents, o.currency_id,
+                  o.shipping_id, o.shipping_status, o.shipping_substatus, o.shipping_mode, o.shipping_logistic_type,
+                  o.shipping_type, o.shipping_tracking_number, o.shipping_stage, o.billed_total_cents,
+                  o.gross_received_cents, o.net_received_cents, o.ml_fee_total_cents, o.refunds_total_cents,
+                  o.shipping_cost_cents, o.shipping_compensation_cents,
+                  o.date_created, o.date_closed, o.last_seen_at, o.updated_at
+           FROM marketplace_orders o
+           WHERE o.marketplace = 'mercadolivre'
+             AND o.account_id = ?
+             AND (? IS NULL OR o.status = ?)
+             AND (? = '%%' OR o.marketplace_order_id LIKE ? OR COALESCE(o.buyer_nickname, '') LIKE ?)
+           ORDER BY COALESCE(o.date_created, o.updated_at) DESC
+           LIMIT ?`
+        )
+        .all(accountId, status, status, likeValue, likeValue, likeValue, query.limit)
+    : db
+        .prepare(
+          `SELECT o.id, o.account_id, o.marketplace_order_id, o.seller_id, o.buyer_id, o.buyer_nickname,
+                  o.status, o.substatus, o.order_total_cents, o.paid_amount_cents, o.currency_id,
+                  o.shipping_id, o.shipping_status, o.shipping_substatus, o.shipping_mode, o.shipping_logistic_type,
+                  o.shipping_type, o.shipping_tracking_number, o.shipping_stage, o.billed_total_cents,
+                  o.gross_received_cents, o.net_received_cents, o.ml_fee_total_cents, o.refunds_total_cents,
+                  o.shipping_cost_cents, o.shipping_compensation_cents,
+                  o.date_created, o.date_closed, o.last_seen_at, o.updated_at
+           FROM marketplace_orders o
+           WHERE o.marketplace = 'mercadolivre'
+             AND (? IS NULL OR o.status = ?)
+             AND (? = '%%' OR o.marketplace_order_id LIKE ? OR COALESCE(o.buyer_nickname, '') LIKE ?)
+           ORDER BY COALESCE(o.date_created, o.updated_at) DESC
+           LIMIT ?`
+        )
+        .all(status, status, likeValue, likeValue, likeValue, query.limit);
+
+  const result = rows.map((row: any) => {
+    const items = db
+      .prepare(
+        `SELECT oi.id, oi.marketplace_item_id, oi.marketplace_variation_id, oi.variation_key,
+                oi.title, oi.quantity, oi.unit_price_cents, oi.total_price_cents, oi.currency_id,
+                oi.linked_catalog_variation_id, oi.linked_catalog_variation_label
+         FROM marketplace_order_items oi
+         WHERE oi.order_id = ?
+         ORDER BY oi.updated_at DESC`
+      )
+      .all(row.id);
+
+    return {
+      ...row,
+      order_items: items,
+    };
+  });
+
+  return result;
+});
 
 app.get("/logs", async () => {
   return db

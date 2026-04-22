@@ -1,0 +1,10 @@
+ALTER TABLE marketplace_catalog_items ADD COLUMN base_price_cents INTEGER;
+ALTER TABLE marketplace_catalog_items ADD COLUMN promotion_price_cents INTEGER;
+ALTER TABLE marketplace_catalog_items ADD COLUMN effective_price_cents INTEGER;
+ALTER TABLE marketplace_catalog_items ADD COLUMN effective_currency_id TEXT;
+ALTER TABLE marketplace_catalog_items ADD COLUMN estimated_sale_fee_cents INTEGER;
+ALTER TABLE marketplace_catalog_items ADD COLUMN estimated_listing_fee_cents INTEGER;
+ALTER TABLE marketplace_catalog_items ADD COLUMN estimated_net_proceeds_cents INTEGER;
+ALTER TABLE marketplace_catalog_items ADD COLUMN estimated_fee_currency_id TEXT;
+ALTER TABLE marketplace_catalog_items ADD COLUMN promotion_id TEXT;
+ALTER TABLE marketplace_catalog_items ADD COLUMN promotion_type TEXT;

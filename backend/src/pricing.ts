@@ -33,6 +33,17 @@ export type QuoteComputationResult = {
   };
 };
 
+export type ContributionMarginInput = {
+  revenueCents: number;
+  variableCostCents: number;
+  taxCents: number;
+};
+
+export type ContributionMarginResult = {
+  contribution_margin_cents: number;
+  contribution_margin_bps: number;
+};
+
 export function computeQuote(input: QuoteComputationInput): QuoteComputationResult {
   const units = Math.max(1, Math.trunc(input.unitsProduced));
 
@@ -88,5 +99,19 @@ export function computeQuote(input: QuoteComputationInput): QuoteComputationResu
       extrasBatchCents,
       packagingBatchCents,
     },
+  };
+}
+
+export function computeContributionMargin(
+  input: ContributionMarginInput
+): ContributionMarginResult {
+  const revenue = Math.max(0, Math.round(Number(input.revenueCents || 0)));
+  const variableCost = Math.max(0, Math.round(Number(input.variableCostCents || 0)));
+  const tax = Math.max(0, Math.round(Number(input.taxCents || 0)));
+  const contribution = revenue - variableCost - tax;
+  const bps = revenue > 0 ? Math.round((contribution * 10000) / revenue) : 0;
+  return {
+    contribution_margin_cents: contribution,
+    contribution_margin_bps: bps,
   };
 }

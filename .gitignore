@@ -16,3 +16,13 @@ storage/
 # logs and temp files
 *.log
 *.tmp
+
+# env files (keep only examples in git)
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!.env.*.example
+!**/.env.example
+!**/.env.*.example

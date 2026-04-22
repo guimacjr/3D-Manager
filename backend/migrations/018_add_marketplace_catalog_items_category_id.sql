@@ -1,0 +1,2 @@
+-- no-op migration
+-- category_id is ensured at runtime in backend/src/index.ts (ensureMarketplaceCatalogItemColumns)
