@@ -1,3 +1,10 @@
+import {
+  finishHttpSpan,
+  injectTraceHeaders,
+  normalizeMercadoLivreRoute,
+  startMercadoLivreHttpSpan,
+} from "./telemetry.js";
+
 const ML_AUTH_BASE_URL = "https://auth.mercadolivre.com.br";
 const ML_API_BASE_URL = "https://api.mercadolibre.com";
 const ML_MIN_REQUEST_INTERVAL_MS = Math.max(
@@ -8,6 +15,7 @@ const ML_RATE_LIMIT_RETRY_MS = Math.max(
   250,
   Math.round(Number(process.env.ML_RATE_LIMIT_RETRY_MS ?? 2000))
 );
+const ML_ITEMS_MULTI_GET_MAX_IDS = 20;
 
 let mlRequestQueue: Promise<void> = Promise.resolve();
 let mlLastRequestAt = 0;
@@ -102,6 +110,7 @@ type MercadoLivreItemVariationResponse = Array<{
 type MercadoLivreOrdersSearchResponse = {
   results?: Array<{
     id?: number;
+    pack_id?: number | string | null;
     status?: string;
     status_detail?: string;
     total_amount?: number;
@@ -130,6 +139,7 @@ type MercadoLivreOrdersSearchResponse = {
 
 type MercadoLivreOrderDetailResponse = {
   id?: number;
+  pack_id?: number | string | null;
   status?: string;
   status_detail?: string;
   total_amount?: number;
@@ -151,6 +161,7 @@ type MercadoLivreOrderDetailResponse = {
     item?: {
       id?: string;
       title?: string;
+      variation_id?: number | string | null;
     };
     quantity?: number;
     unit_price?: number;
@@ -287,6 +298,7 @@ export type MercadoLivreItemVariationSnapshot = {
 
 export type MercadoLivreOrderSnapshot = {
   id: string;
+  packId?: string;
   sellerId: string;
   buyerId?: string;
   buyerNickname?: string;
@@ -406,8 +418,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function chunkArray<T>(items: T[], chunkSize: number): T[][] {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+  return chunks;
+}
+
 async function mercadoLivreFetch(url: string, init: RequestInit): Promise<Response> {
-  let releaseQueue: (() => void) | null = null;
+  let releaseQueue: () => void = () => {};
   const gate = new Promise<void>((resolve) => {
     releaseQueue = resolve;
   });
@@ -415,6 +435,15 @@ async function mercadoLivreFetch(url: string, init: RequestInit): Promise<Respon
   mlRequestQueue = previousQueue.then(() => gate);
 
   await previousQueue;
+  const method = init.method ?? "GET";
+  const { span, spanContext } = startMercadoLivreHttpSpan({
+    method,
+    url,
+    route: normalizeMercadoLivreRoute(url),
+  });
+  const headers = new Headers(init.headers);
+  injectTraceHeaders(headers, spanContext);
+
   try {
     const elapsed = Date.now() - mlLastRequestAt;
     const waitMs = Math.max(0, ML_MIN_REQUEST_INTERVAL_MS - elapsed);
@@ -422,10 +451,12 @@ async function mercadoLivreFetch(url: string, init: RequestInit): Promise<Respon
       await sleep(waitMs);
     }
 
-    let response = await fetch(url, init);
+    let retryCount = 0;
+    let response = await fetch(url, { ...init, headers });
     mlLastRequestAt = Date.now();
 
     if (response.status === 429) {
+      retryCount = 1;
       const retryAfterHeader = response.headers.get("retry-after");
       const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : NaN;
       const retryMs =
@@ -433,13 +464,21 @@ async function mercadoLivreFetch(url: string, init: RequestInit): Promise<Respon
           ? Math.round(retryAfterSeconds * 1000)
           : ML_RATE_LIMIT_RETRY_MS;
       await sleep(retryMs);
-      response = await fetch(url, init);
+      response = await fetch(url, { ...init, headers });
       mlLastRequestAt = Date.now();
     }
 
+    finishHttpSpan(span, {
+      statusCode: response.status,
+      retryCount,
+    });
+
     return response;
+  } catch (error) {
+    finishHttpSpan(span, { error });
+    throw error;
   } finally {
-    releaseQueue?.();
+    releaseQueue();
   }
 }
 
@@ -599,47 +638,50 @@ export async function fetchMercadoLivreItems(params: {
   accessToken: string;
   itemIds: string[];
 }): Promise<MercadoLivreItemSnapshot[]> {
-  const validIds = params.itemIds.map((item) => item.trim()).filter(Boolean);
+  const validIds = Array.from(new Set(params.itemIds.map((item) => item.trim()).filter(Boolean)));
   if (validIds.length === 0) return [];
 
-  const url = new URL(`${ML_API_BASE_URL}/items`);
-  url.searchParams.set("ids", validIds.join(","));
-
-  const response = await mercadoLivreFetch(url.toString(), {
-    headers: {
-      authorization: `Bearer ${params.accessToken}`,
-      accept: "application/json",
-    },
-  });
-
-  const parsed = await parseApiResponse(response);
-  if (!response.ok) {
-    throw new MercadoLivreApiError("Mercado Livre items fetch failed", response.status, parsed);
-  }
-
-  const entries = Array.isArray(parsed) ? (parsed as MercadoLivreMultiGetItemEntry[]) : [];
   const snapshots: MercadoLivreItemSnapshot[] = [];
 
-  for (const entry of entries) {
-    if (entry.code < 200 || entry.code >= 300 || !entry.body?.id || !entry.body.title) continue;
-    snapshots.push({
-      id: entry.body.id,
-      title: entry.body.title,
-      status: entry.body.status,
-      condition: entry.body.condition,
-      permalink: entry.body.permalink,
-      thumbnail: entry.body.thumbnail,
-      currencyId: entry.body.currency_id,
-      categoryId: entry.body.category_id,
-      listingTypeId: entry.body.listing_type_id,
-      price: typeof entry.body.price === "number" ? entry.body.price : undefined,
-      availableQuantity:
-        typeof entry.body.available_quantity === "number" ? Math.round(entry.body.available_quantity) : undefined,
-      soldQuantity: typeof entry.body.sold_quantity === "number" ? Math.round(entry.body.sold_quantity) : undefined,
-      siteId: entry.body.site_id,
-      sellerId: typeof entry.body.seller_id === "number" ? String(entry.body.seller_id) : undefined,
-      raw: entry.body,
+  for (const batchIds of chunkArray(validIds, ML_ITEMS_MULTI_GET_MAX_IDS)) {
+    const url = new URL(`${ML_API_BASE_URL}/items`);
+    url.searchParams.set("ids", batchIds.join(","));
+
+    const response = await mercadoLivreFetch(url.toString(), {
+      headers: {
+        authorization: `Bearer ${params.accessToken}`,
+        accept: "application/json",
+      },
     });
+
+    const parsed = await parseApiResponse(response);
+    if (!response.ok) {
+      throw new MercadoLivreApiError("Mercado Livre items fetch failed", response.status, parsed);
+    }
+
+    const entries = Array.isArray(parsed) ? (parsed as MercadoLivreMultiGetItemEntry[]) : [];
+
+    for (const entry of entries) {
+      if (entry.code < 200 || entry.code >= 300 || !entry.body?.id || !entry.body.title) continue;
+      snapshots.push({
+        id: entry.body.id,
+        title: entry.body.title,
+        status: entry.body.status,
+        condition: entry.body.condition,
+        permalink: entry.body.permalink,
+        thumbnail: entry.body.thumbnail,
+        currencyId: entry.body.currency_id,
+        categoryId: entry.body.category_id,
+        listingTypeId: entry.body.listing_type_id,
+        price: typeof entry.body.price === "number" ? entry.body.price : undefined,
+        availableQuantity:
+          typeof entry.body.available_quantity === "number" ? Math.round(entry.body.available_quantity) : undefined,
+        soldQuantity: typeof entry.body.sold_quantity === "number" ? Math.round(entry.body.sold_quantity) : undefined,
+        siteId: entry.body.site_id,
+        sellerId: typeof entry.body.seller_id === "number" ? String(entry.body.seller_id) : undefined,
+        raw: entry.body,
+      });
+    }
   }
 
   return snapshots;
@@ -788,6 +830,8 @@ export async function fetchMercadoLivreSellerOrders(params: {
   sellerId: string;
   offset?: number;
   limit?: number;
+  dateCreatedFrom?: string;
+  dateCreatedTo?: string;
 }): Promise<{ orders: MercadoLivreOrderSnapshot[]; total: number; offset: number; limit: number }> {
   const offset = Math.max(0, Math.round(params.offset ?? 0));
   const limit = Math.max(1, Math.min(50, Math.round(params.limit ?? 50)));
@@ -796,6 +840,8 @@ export async function fetchMercadoLivreSellerOrders(params: {
   url.searchParams.set("offset", String(offset));
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("sort", "date_desc");
+  if (params.dateCreatedFrom) url.searchParams.set("order.date_created.from", params.dateCreatedFrom);
+  if (params.dateCreatedTo) url.searchParams.set("order.date_created.to", params.dateCreatedTo);
 
   const response = await mercadoLivreFetch(url.toString(), {
     headers: {
@@ -813,8 +859,9 @@ export async function fetchMercadoLivreSellerOrders(params: {
   const orders = (payload.results ?? [])
     .filter((item) => typeof item?.id === "number")
     .map((item) => ({
-      id: String(item.id),
-      sellerId:
+	      id: String(item.id),
+	      packId: item.pack_id !== undefined && item.pack_id !== null ? String(item.pack_id) : undefined,
+	      sellerId:
         typeof item.seller?.id === "number" ? String(item.seller.id) : params.sellerId,
       buyerId: typeof item.buyer?.id === "number" ? String(item.buyer.id) : undefined,
       buyerNickname: item.buyer?.nickname,
@@ -876,8 +923,10 @@ export async function fetchMercadoLivreOrderDetail(params: {
       return {
         marketplaceItemId: String(line.item?.id),
         marketplaceVariationId:
-          line.variation_id !== undefined && line.variation_id !== null
-            ? String(line.variation_id)
+          line.item?.variation_id !== undefined && line.item?.variation_id !== null
+            ? String(line.item.variation_id)
+            : line.variation_id !== undefined && line.variation_id !== null
+              ? String(line.variation_id)
             : undefined,
         title: String(line.item?.title ?? "Sem título"),
         quantity,
@@ -896,8 +945,9 @@ export async function fetchMercadoLivreOrderDetail(params: {
 
   return {
     order: {
-      id: orderId,
-      sellerId,
+	      id: orderId,
+	      packId: order.pack_id !== undefined && order.pack_id !== null ? String(order.pack_id) : undefined,
+	      sellerId,
       buyerId: typeof order.buyer?.id === "number" ? String(order.buyer.id) : undefined,
       buyerNickname: order.buyer?.nickname,
       status: order.status,

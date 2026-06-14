@@ -11,6 +11,10 @@ services:
       PORT: "3333"
       DB_PATH: /data/data.sqlite
       MEDIA_ROOT: /data/storage/media
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-3d-manager-backend}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
+      OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
     volumes:
       - backend_data:/data
     ports:

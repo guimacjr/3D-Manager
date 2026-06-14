@@ -65,6 +65,16 @@ Servidor padrao: `http://localhost:3333`
 - `GET /integrations/mercadolivre/orders` (pedidos sincronizados localmente)
   - inclui status logistico (etiqueta/impresso/em transito/entregue), tipo de frete e itens do pedido
   - inclui campos financeiros estimados: faturado, recebido bruto/liquido, taxas ML, estornos e ajustes de frete
+  - inclui snapshot do custo do SKU no momento da primeira sincronizacao do item, com energia, payback e filamentos por tipo de material
+  - inclui `snapshot_status` por pedido, com motivo consolidado quando algum item for ignorado
+- `POST /integrations/mercadolivre/orders/recalculate-snapshots`
+  - refaz o snapshot de custo de todos os pedidos locais (ou por conta via `account_id`)
+- `POST /integrations/mercadolivre/orders/:id/recalculate-snapshots`
+  - refaz o snapshot apenas do pedido local informado
+- `GET /integrations/mercadolivre/orders/dashboard`
+  - consolida vendas, custos salvos, lucro bruto/liquido e ranking de materiais usados
+- `POST /integrations/mercadolivre/sync/:runId/cancel`
+  - solicita interrupcao de uma sincronizacao em andamento; a transacao SQL da sync e revertida
 
 ## Integracao Mercado Livre (OAuth)
 Variaveis de ambiente necessarias no backend:
@@ -77,6 +87,25 @@ Fluxo:
 2. Redirecionar o usuario para o `authorize_url`.
 3. Configurar o callback da aplicacao para `GET /integrations/mercadolivre/callback`.
 4. Consultar `GET /integrations/mercadolivre/status` para acompanhar contas conectadas e refresh de token.
+
+## Telemetria OpenTelemetry
+
+A integracao com Mercado Livre possui tracing OTEL opcional.
+
+Variaveis principais:
+- `OTEL_SERVICE_NAME` (default sugerido: `3d-manager-backend`)
+- `OTEL_EXPORTER_OTLP_ENDPOINT`
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+- `OTEL_SDK_DISABLED=true` para desativar explicitamente
+
+Sem endpoint OTLP configurado, o SDK nao inicializa e o backend funciona sem exportar traces.
+
+Spans instrumentados:
+- `mercadolivre.sync.catalog`
+- `mercadolivre.sync.orders`
+- `mercadolivre.http`
+
+Os spans HTTP usam rota normalizada, metodo, status e quantidade de retries, sem gravar tokens ou query completa.
 
 ## Notas de calculo no POST /quotes
 - Recebe `units_produced` (default 1)

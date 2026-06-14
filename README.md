@@ -162,7 +162,24 @@ ML_RATE_LIMIT_RETRY_MS=2000
 PORT=3333
 # DB_PATH=/absolute/path/to/backend/data.sqlite
 # MEDIA_ROOT=/absolute/path/to/backend/storage/media
+
+# OpenTelemetry opcional
+OTEL_SERVICE_NAME=3d-manager-backend
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+# OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://localhost:4318/v1/traces
+# OTEL_SDK_DISABLED=false
 ```
+
+### Telemetria OpenTelemetry
+
+O backend instrumenta a comunicação com o Mercado Livre usando OpenTelemetry:
+
+- spans pais para `mercadolivre.sync.catalog` e `mercadolivre.sync.orders`;
+- spans client para chamadas HTTP ao Mercado Livre;
+- propagação `traceparent` nas chamadas externas;
+- correlação de logs de sync com `trace_id` e `span_id`.
+
+Por padrão, se nenhum endpoint OTLP estiver configurado, a telemetria fica inativa e o app segue normal. Para ativar, configure `OTEL_EXPORTER_OTLP_ENDPOINT` ou `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` apontando para um collector compatível com OTLP.
 
 ### Build web em Docker
 

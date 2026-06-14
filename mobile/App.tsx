@@ -7,16 +7,21 @@ import {
   SafeAreaView,
   ScrollView,
   StyleSheet,
+  StyleProp,
   Text,
   TextInput,
+  TextStyle,
   useWindowDimensions,
   View,
+  ViewStyle,
 } from "react-native";
 
 type ScreenKey =
   | "dashboard"
   | "marketplaces"
+  | "marketplaceOrdersDashboard"
   | "marketplaceListings"
+  | "marketplaceListingConfig"
   | "printers"
   | "printerForm"
   | "filaments"
@@ -226,8 +231,11 @@ type OperationLogItem = {
   entityId: string;
   summary: string;
   payloadJson: string;
+  payload: Record<string, any> | null;
   createdAt: string;
 };
+
+type MarketplaceOrdersSyncMode = "light" | "normal" | "full";
 
 type MarketplaceAccountStatus = {
   id: string;
@@ -268,6 +276,17 @@ type MarketplaceCustomRequestResponse = {
   ok: boolean;
   headers: Record<string, string>;
   data: unknown;
+};
+
+type MarketplaceNormalizationRule = {
+  id: string;
+  marketplace: string;
+  category: string;
+  raw_value: string;
+  normalized_label: string;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
 };
 
 type MarketplaceCatalogVariationItem = {
@@ -322,10 +341,30 @@ function normalizeMarketplaceCatalogVariationItem(
   };
 }
 
+function resolveMarketplaceNormalizedLabel(
+  rules: MarketplaceNormalizationRule[],
+  category: string,
+  rawValue: string | null | undefined,
+  fallback = "-"
+) {
+  const raw = (rawValue ?? "").trim();
+  if (!raw) return fallback;
+  const rule = rules.find(
+    (item) =>
+      item.category === category &&
+      item.raw_value === raw &&
+      item.is_active === 1 &&
+      item.normalized_label.trim().length > 0
+  );
+  return rule?.normalized_label ?? raw;
+}
+
 type MarketplaceOrderItem = {
   id: string;
   account_id: string;
   marketplace_order_id: string;
+  marketplace_order_ids?: string[];
+  pack_id: string | null;
   seller_id: string;
   buyer_id: string | null;
   buyer_nickname: string | null;
@@ -353,11 +392,46 @@ type MarketplaceOrderItem = {
   date_closed: string | null;
   last_seen_at: string;
   updated_at: string;
+  snapshot_status?: {
+    code: "ok" | "pending" | "partial" | "ignored";
+    label: string;
+    summary: string;
+    ok_items: number;
+    pending_items: number;
+    unresolved_items: number;
+    reasons: Array<{
+      code: "linked_sku_missing" | "production_cost_unavailable";
+      count: number;
+      label: string;
+    }>;
+  };
+  metrics?: {
+    itemsCount: number;
+    itemsWithCostSnapshot: number;
+    itemsWithoutCostSnapshot: number;
+    unitsSold: number;
+    grossRevenueCents: number;
+    netReceivedCents: number | null;
+    productionCostCents: number;
+    energyCostCents: number;
+    paybackCostCents: number;
+    filamentCostCents: number;
+    otherCostCents: number;
+    grossProfitCents: number;
+    netProfitCents: number | null;
+    filamentMaterials: Array<{
+      material_type: string;
+      total_cost_cents: number;
+      total_weight_grams: number;
+    }>;
+  };
   order_items: Array<{
     id: string;
     marketplace_item_id: string;
     marketplace_variation_id: string | null;
     variation_key: string;
+    effective_marketplace_variation_id: string | null;
+    effective_variation_key: string;
     title: string;
     quantity: number;
     unit_price_cents: number | null;
@@ -365,6 +439,121 @@ type MarketplaceOrderItem = {
     currency_id: string | null;
     linked_catalog_variation_id: string | null;
     linked_catalog_variation_label: string | null;
+    current_linked_catalog_variation_id: string | null;
+    current_linked_catalog_variation_label: string | null;
+    current_linked_sku_id: string | null;
+    current_linked_sku_code: string | null;
+    current_linked_sku_name: string | null;
+    cost_snapshot_sku_id: string | null;
+    cost_snapshot_sku_code: string | null;
+    cost_snapshot_sku_name: string | null;
+    cost_snapshot_source_quote_id: string | null;
+    unit_production_cost_cents: number | null;
+    unit_energy_cost_cents: number | null;
+    unit_payback_cost_cents: number | null;
+    unit_filament_cost_cents: number | null;
+    unit_other_cost_cents: number | null;
+    cost_snapshot_at: string | null;
+    stock_status?: {
+      code: "missing_sku" | "ignored_fulfillment" | "ignored_cancelled" | "moved" | "pending_movement";
+      label: string;
+      summary: string;
+      expected_delta: number;
+      moved_delta: number;
+    };
+    filament_cost_breakdown: Array<{
+      material_type: string;
+      unit_cost_cents: number;
+      total_cost_cents: number;
+      used_weight_grams_per_unit: number;
+      used_weight_grams_total: number;
+    }>;
+  }>;
+};
+
+type MarketplaceOrdersDashboardResponse = {
+  marketplace: string;
+  generated_at: string;
+  totals: {
+    orders_count: number;
+    orders_with_net_received: number;
+    items_count: number;
+    items_with_cost_snapshot: number;
+    items_without_cost_snapshot: number;
+    units_sold: number;
+    gross_revenue_cents: number;
+    net_received_cents: number;
+    production_cost_cents: number;
+    energy_cost_cents: number;
+    payback_cost_cents: number;
+    filament_cost_cents: number;
+    other_cost_cents: number;
+    gross_profit_cents: number;
+    net_profit_cents: number;
+  };
+  accounts: Array<{
+    account_id: string;
+    seller_nickname: string | null;
+    orders_count: number;
+    units_sold: number;
+    gross_revenue_cents: number;
+    net_received_cents: number;
+    production_cost_cents: number;
+    gross_profit_cents: number;
+    net_profit_cents: number;
+  }>;
+  filament_materials: Array<{
+    material_type: string;
+    total_cost_cents: number;
+    total_weight_grams: number;
+  }>;
+  recent_orders: Array<{
+    id: string;
+    account_id: string;
+    seller_nickname: string | null;
+	    marketplace_order_id: string;
+	    buyer_nickname: string | null;
+	    status: string | null;
+	    substatus: string | null;
+	    shipping_status: string | null;
+	    shipping_substatus: string | null;
+	    shipping_mode: string | null;
+	    shipping_logistic_type: string | null;
+	    shipping_type: string | null;
+	    shipping_stage: string | null;
+	    date_created: string | null;
+	    updated_at: string;
+    itemsCount: number;
+    itemsWithCostSnapshot: number;
+    itemsWithoutCostSnapshot: number;
+    unitsSold: number;
+    grossRevenueCents: number;
+    netReceivedCents: number | null;
+    productionCostCents: number;
+    energyCostCents: number;
+    paybackCostCents: number;
+    filamentCostCents: number;
+    otherCostCents: number;
+    grossProfitCents: number;
+    netProfitCents: number | null;
+    snapshot_status: {
+      code: "ok" | "pending" | "partial" | "ignored";
+      label: string;
+      summary: string;
+      ok_items: number;
+      pending_items: number;
+      unresolved_items: number;
+      reasons: Array<{
+        code: "linked_sku_missing" | "production_cost_unavailable";
+        count: number;
+        label: string;
+      }>;
+    };
+    filamentMaterials: Array<{
+      material_type: string;
+      total_cost_cents: number;
+      total_weight_grams: number;
+    }>;
   }>;
 };
 
@@ -504,6 +693,33 @@ const generateInternalSkuCode = () => {
 };
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://localhost:3333";
+const WEEK_DAYS = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sab"];
+const MARKETPLACE_ORDERS_CHARTS_VISIBLE_COOKIE = "marketplace_orders_dashboard_charts_visible";
+
+function readCookieBoolean(key: string, fallback: boolean) {
+  try {
+    const documentRef = (globalThis as unknown as { document?: { cookie?: string } }).document;
+    const cookies = documentRef?.cookie?.split(";").map((item) => item.trim()) ?? [];
+    const cookie = cookies.find((item) => item.startsWith(`${encodeURIComponent(key)}=`));
+    const value = cookie ? decodeURIComponent(cookie.slice(cookie.indexOf("=") + 1)) : null;
+    if (value === "true") return true;
+    if (value === "false") return false;
+  } catch {
+    return fallback;
+  }
+  return fallback;
+}
+
+function writeCookieBoolean(key: string, value: boolean) {
+  try {
+    const documentRef = (globalThis as unknown as { document?: { cookie?: string } }).document;
+    if (!documentRef) return;
+    const maxAgeSeconds = 60 * 60 * 24 * 365;
+    documentRef.cookie = `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}; Max-Age=${maxAgeSeconds}; Path=/; SameSite=Lax`;
+  } catch {
+    // Cookie persistence is best-effort on non-web targets.
+  }
+}
 
 function parseLocaleNumber(raw: string | number): number {
   if (typeof raw === "number") return raw;
@@ -883,13 +1099,23 @@ function mapSalesPointOverviewFromApi(row: any): SalesPointOverview {
 }
 
 function mapOperationLogFromApi(row: any): OperationLogItem {
+  const payloadJson = row.payload_json ?? "";
+  let payload: Record<string, any> | null = null;
+  try {
+    const parsed = payloadJson ? JSON.parse(payloadJson) : null;
+    payload = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    payload = null;
+  }
+
   return {
     id: row.id,
     eventType: row.event_type ?? "",
     entityType: row.entity_type ?? "",
     entityId: row.entity_id ?? "",
     summary: row.summary ?? "",
-    payloadJson: row.payload_json ?? "",
+    payloadJson,
+    payload,
     createdAt: row.created_at ?? "",
   };
 }
@@ -1057,6 +1283,34 @@ const dateTime = (value: string) => {
   return parsed.toLocaleString("pt-BR");
 };
 
+const formatLocalDateKey = (date: Date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+
+const parseLocalDateKey = (value: string) => {
+  const [year, month, day] = value.split("-").map(Number);
+  if (!year || !month || !day) return new Date();
+  return new Date(year, month - 1, day);
+};
+
+const addLocalDays = (date: Date, days: number) =>
+  new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
+
+const startOfLocalDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
+const endOfLocalDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
+
+const buildCalendarCells = (cursor: Date): Array<Date | null> => {
+  const firstDay = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
+  const firstWeekDay = firstDay.getDay();
+  const daysInMonth = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0).getDate();
+  const cells: Array<Date | null> = [];
+  for (let i = 0; i < firstWeekDay; i += 1) cells.push(null);
+  for (let day = 1; day <= daysInMonth; day += 1) {
+    cells.push(new Date(cursor.getFullYear(), cursor.getMonth(), day));
+  }
+  while (cells.length % 7 !== 0) cells.push(null);
+  return cells;
+};
+
 const shippingStageLabel = (value: string | null | undefined) => {
   const stage = (value ?? "").toLowerCase();
   if (!stage) return "-";
@@ -1090,6 +1344,127 @@ const printerCostPerMinute = (printer: Printer, settings: CostSettings) => {
   return energyPerMin + paybackPerMin;
 };
 
+type AppButtonVariant = "primary" | "secondary" | "small" | "danger" | "nav";
+
+const APP_BUTTON_THEME: Record<
+  AppButtonVariant,
+  {
+    active: ViewStyle;
+    inactive: ViewStyle;
+    disabled: ViewStyle;
+    textActive: TextStyle;
+    textInactive: TextStyle;
+    textDisabled: TextStyle;
+  }
+> = {
+  primary: {
+    active: { backgroundColor: "#1e3a79", borderColor: "#1e3a79" },
+    inactive: { backgroundColor: "#1e3a79", borderColor: "#1e3a79" },
+    disabled: { opacity: 0.5 },
+    textActive: { color: "#f5f8ff", fontSize: 13, fontWeight: "700" },
+    textInactive: { color: "#f5f8ff", fontSize: 13, fontWeight: "700" },
+    textDisabled: { color: "#f5f8ff" },
+  },
+  secondary: {
+    active: { backgroundColor: "#e0eaff", borderColor: "#1e3a79" },
+    inactive: { backgroundColor: "#ffffff", borderColor: "#9cb0d8" },
+    disabled: { opacity: 0.5 },
+    textActive: { color: "#1b376d", fontSize: 13, fontWeight: "700" },
+    textInactive: { color: "#29467f", fontSize: 13, fontWeight: "700" },
+    textDisabled: { color: "#6b768f" },
+  },
+  small: {
+    active: { backgroundColor: "#1e3a79", borderColor: "#1e3a79" },
+    inactive: { backgroundColor: "#eef3ff", borderColor: "#eef3ff" },
+    disabled: { opacity: 0.5 },
+    textActive: { color: "#f5f8ff", fontSize: 12, fontWeight: "700", textAlign: "center" },
+    textInactive: { color: "#23407e", fontSize: 12, fontWeight: "700", textAlign: "center" },
+    textDisabled: { color: "#6b768f" },
+  },
+  danger: {
+    active: { backgroundColor: "#b42318", borderColor: "#b42318" },
+    inactive: { backgroundColor: "#ffe8e8", borderColor: "#f2bcbc" },
+    disabled: { opacity: 0.5 },
+    textActive: { color: "#ffffff", fontSize: 12, fontWeight: "700", textAlign: "center" },
+    textInactive: { color: "#902222", fontSize: 12, fontWeight: "700", textAlign: "center" },
+    textDisabled: { color: "#7f1d1d" },
+  },
+  nav: {
+    active: { backgroundColor: "#213b74", borderColor: "#213b74" },
+    inactive: { backgroundColor: "#e8ecf7", borderColor: "#e8ecf7" },
+    disabled: { opacity: 0.5 },
+    textActive: { color: "#ffffff", fontSize: 12, lineHeight: 14, fontWeight: "700", textAlign: "center" },
+    textInactive: { color: "#23314f", fontSize: 12, lineHeight: 14, fontWeight: "600", textAlign: "center" },
+    textDisabled: { color: "#6b768f" },
+  },
+};
+
+function AppButton({
+  label,
+  onPress,
+  variant = "secondary",
+  active = false,
+  disabled = false,
+  style,
+  textStyle,
+  activeStyle,
+  inactiveStyle,
+  disabledStyle,
+  activeTextStyle,
+  inactiveTextStyle,
+  disabledTextStyle,
+  numberOfLines = 1,
+}: {
+  label: string;
+  onPress: () => void;
+  variant?: AppButtonVariant;
+  active?: boolean;
+  disabled?: boolean;
+  style?: StyleProp<ViewStyle>;
+  textStyle?: StyleProp<TextStyle>;
+  activeStyle?: StyleProp<ViewStyle>;
+  inactiveStyle?: StyleProp<ViewStyle>;
+  disabledStyle?: StyleProp<ViewStyle>;
+  activeTextStyle?: StyleProp<TextStyle>;
+  inactiveTextStyle?: StyleProp<TextStyle>;
+  disabledTextStyle?: StyleProp<TextStyle>;
+  numberOfLines?: number;
+}) {
+  const theme = APP_BUTTON_THEME[variant];
+
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      style={[
+        styles.appButtonBase,
+        styles[`appButton${variant[0].toUpperCase()}${variant.slice(1)}` as keyof typeof styles] as ViewStyle,
+        style,
+        active ? theme.active : theme.inactive,
+        active ? activeStyle : inactiveStyle,
+        disabled && theme.disabled,
+        disabled && styles.buttonDisabled,
+        disabled && disabledStyle,
+      ]}
+    >
+      <Text
+        allowFontScaling={false}
+        numberOfLines={numberOfLines}
+        style={[
+          styles.appButtonTextBase,
+          textStyle,
+          active ? theme.textActive : theme.textInactive,
+          active ? activeTextStyle : inactiveTextStyle,
+          disabled && theme.textDisabled,
+          disabled && disabledTextStyle,
+        ]}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
 function NavButton({
   active,
   label,
@@ -1104,22 +1479,13 @@ function NavButton({
   responsiveWidth?: boolean;
 }) {
   return (
-    <Pressable
+    <AppButton
+      label={label}
       onPress={onPress}
-      style={[
-        styles.navButtonBase,
-        responsiveWidth ? (compact ? styles.navButtonCompact : styles.navButtonFill) : styles.navButtonWide,
-        active && styles.navButtonActive,
-      ]}
-    >
-      <Text
-        allowFontScaling={false}
-        numberOfLines={1}
-        style={[styles.navButtonText, active && styles.navButtonTextActive]}
-      >
-        {label}
-      </Text>
-    </Pressable>
+      variant="nav"
+      active={active}
+      style={responsiveWidth ? (compact ? styles.navButtonCompact : styles.navButtonFill) : styles.navButtonWide}
+    />
   );
 }
 
@@ -1140,44 +1506,30 @@ function NavDropdown({
   onSelectItem: (onPress: () => void) => void;
   compact?: boolean;
 }) {
-  return (
-    <View style={[styles.navDropdownWrap, compact && styles.navDropdownWrapCompact]}>
-      <Pressable
-        onPress={onToggle}
-        style={[
-          styles.navButtonBase,
-          styles.navDropdownTrigger,
-          compact && styles.navButtonCompact,
-          active && styles.navButtonActive,
-        ]}
-      >
-        <Text
-          allowFontScaling={false}
-          numberOfLines={1}
-          style={[styles.navButtonText, active && styles.navButtonTextActive]}
-        >
-          {label} v
-        </Text>
-      </Pressable>
-      {isOpen && (
-        <View style={styles.navDropdownMenu}>
-          {items.map((item) => (
-            <Pressable
-              key={item.label}
-              style={[
-                styles.navButtonBase,
-                styles.navDropdownItem,
-                item.active && styles.navDropdownItemActive,
-              ]}
-              onPress={() => onSelectItem(item.onPress)}
-            >
-              <Text style={[styles.navButtonText, styles.navDropdownItemText, item.active && styles.navDropdownItemTextActive]}>
-                {item.label}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-      )}
+	  return (
+	    <View style={[styles.navDropdownWrap, compact && styles.navDropdownWrapCompact]}>
+	      <AppButton
+	        label={`${label} v`}
+	        onPress={onToggle}
+	        variant="nav"
+	        active={active}
+	        style={[styles.navDropdownTrigger, compact ? styles.navButtonCompact : undefined]}
+	      />
+	      {isOpen && (
+	        <View style={styles.navDropdownMenu}>
+	          {items.map((item) => (
+	            <AppButton
+	              key={item.label}
+	              label={item.label}
+	              onPress={() => onSelectItem(item.onPress)}
+	              variant="nav"
+	              active={item.active}
+	              style={styles.navDropdownItem}
+	              textStyle={styles.navDropdownItemText}
+	            />
+	          ))}
+	        </View>
+	      )}
     </View>
   );
 }
@@ -3567,6 +3919,8 @@ function SalesStockScreen({
     adjustment_out: "Saída",
     consignment_out: "Consignado (saída)",
     consignment_return: "Retorno consignado",
+    marketplace_sale_out: "Venda marketplace",
+    marketplace_sale_reversal: "Reversão marketplace",
     initial: "Inicial",
   };
   const weekDays = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sab"];
@@ -4323,7 +4677,15 @@ function SalesPointsOverviewScreen({
   );
 }
 
-function LogsScreen({ logs }: { logs: OperationLogItem[] }) {
+function LogsScreen({
+  logs,
+  onCancelMarketplaceSync,
+  cancelingRunIds,
+}: {
+  logs: OperationLogItem[];
+  onCancelMarketplaceSync: (runId: string) => void;
+  cancelingRunIds: Record<string, boolean>;
+}) {
   const typeLabels: Record<string, string> = {
     stock_movement_created: "Movimentação de estoque",
     consignment_batch_created: "Envio de consignação",
@@ -4338,49 +4700,1173 @@ function LogsScreen({ logs }: { logs: OperationLogItem[] }) {
     quote_created: "Orçamento criado",
     quote_updated: "Orçamento atualizado",
     quote_deleted: "Orçamento excluído",
+    marketplace_catalog_read_started: "Sync de anúncios iniciado",
+    marketplace_catalog_read_finished: "Sync de anúncios concluído",
+    marketplace_catalog_read_cancelled: "Sync de anúncios interrompido",
+    marketplace_catalog_read_failed: "Sync de anúncios falhou",
+    marketplace_orders_read_started: "Sync de vendas iniciado",
+    marketplace_orders_read_finished: "Sync de vendas concluído",
+    marketplace_orders_read_cancelled: "Sync de vendas interrompido",
+    marketplace_orders_read_failed: "Sync de vendas falhou",
+    marketplace_sync_cancel_requested: "Interrupção solicitada",
   };
+  const finishedRunIds = new Set(
+    logs
+      .filter((log) => ["finished", "cancelled", "error"].includes(String(log.payload?.phase ?? "")))
+      .map((log) => String(log.payload?.run_id ?? log.entityId ?? ""))
+      .filter(Boolean)
+  );
 
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <Text style={styles.pageTitle}>Logs</Text>
       <Text style={styles.pageSubtitle}>Histórico de movimentações e ações</Text>
       {logs.length === 0 && <Text style={styles.text}>Sem logs até o momento.</Text>}
-      {logs.map((log) => (
-        <View key={log.id} style={styles.card}>
-          <Text style={styles.cardTitle}>{typeLabels[log.eventType] ?? log.eventType}</Text>
-          <Text style={styles.text}>Resumo: {log.summary}</Text>
-          <Text style={styles.text}>Data: {dateOnly(log.createdAt)}</Text>
-          <Text style={styles.text}>Entidade: {log.entityType}{log.entityId ? ` (${log.entityId})` : ""}</Text>
-        </View>
-      ))}
+      {logs.map((log) => {
+        const runId = String(log.payload?.run_id ?? log.entityId ?? "");
+        const isMarketplaceSyncStart =
+          log.entityType === "marketplace_sync_run" &&
+          String(log.payload?.phase ?? "") === "started" &&
+          runId &&
+          !finishedRunIds.has(runId);
+
+        return (
+          <View key={log.id} style={styles.card}>
+            <Text style={styles.cardTitle}>{typeLabels[log.eventType] ?? log.eventType}</Text>
+            <Text style={styles.text}>Resumo: {log.summary}</Text>
+            <Text style={styles.text}>Data: {dateOnly(log.createdAt)}</Text>
+            <Text style={styles.text}>Entidade: {log.entityType}{log.entityId ? ` (${log.entityId})` : ""}</Text>
+            {isMarketplaceSyncStart ? (
+              <View style={styles.row}>
+                <Pressable
+                  style={[styles.dangerButton, cancelingRunIds[runId] && styles.buttonDisabled]}
+                  onPress={() => onCancelMarketplaceSync(runId)}
+                  disabled={cancelingRunIds[runId]}
+                >
+                  <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
+                    {cancelingRunIds[runId] ? "Interrompendo..." : "Interromper sincronia"}
+                  </Text>
+                </Pressable>
+              </View>
+            ) : null}
+          </View>
+        );
+      })}
     </ScrollView>
+  );
+}
+
+type MarketplaceOrdersComparisonMode = "previous" | "same_30_days_before";
+type MarketplaceOrdersRangeSelection = "start" | "end";
+type MarketplaceOrdersQuickRange = "today" | "yesterday" | "7d" | "15d" | "30d" | null;
+type MarketplaceOrdersMetricKey = "revenue" | "productionCost" | "ordersCount" | "averageTicket" | "unitsSold";
+
+type MarketplaceOrdersSummary = {
+  revenueCents: number;
+  productionCostCents: number;
+  ordersCount: number;
+  averageTicketCents: number;
+  unitsSold: number;
+  grossProfitCents: number;
+};
+
+type MarketplaceOrderSkuLinkTarget = {
+  accountId: string;
+  marketplaceItemId: string;
+  marketplaceVariationId: string | null;
+  variationKey: string;
+  catalogVariationId: string | null;
+};
+
+function MarketplaceOrdersDashboardSection({
+  orderItems,
+  accounts,
+  normalizationRules,
+  isBusy,
+  taxRatePercent,
+  onRecalculateAllOrderSnapshots,
+  onRecalculateSingleOrderSnapshot,
+  onOpenSkuLinking,
+  isPrivacyMode,
+}: {
+  orderItems: MarketplaceOrderItem[];
+  accounts: MarketplaceAccountStatus[];
+  normalizationRules: MarketplaceNormalizationRule[];
+  isBusy: boolean;
+  taxRatePercent: number;
+  onRecalculateAllOrderSnapshots: () => void;
+  onRecalculateSingleOrderSnapshot: (orderId: string) => void;
+  onOpenSkuLinking: (target: MarketplaceOrderSkuLinkTarget) => void;
+  isPrivacyMode: boolean;
+}) {
+  const todayKey = formatLocalDateKey(new Date());
+  const [rangeStart, setRangeStart] = useState(() => formatLocalDateKey(addLocalDays(new Date(), -29)));
+  const [rangeEnd, setRangeEnd] = useState(() => todayKey);
+  const [activeQuickRange, setActiveQuickRange] = useState<MarketplaceOrdersQuickRange>("30d");
+  const [comparisonMode, setComparisonMode] = useState<MarketplaceOrdersComparisonMode>("previous");
+  const [logisticFilter, setLogisticFilter] = useState("__all__");
+  const [statusFilter, setStatusFilter] = useState("__all__");
+  const [hideCancelled, setHideCancelled] = useState(true);
+  const [expandedOrderIds, setExpandedOrderIds] = useState<Record<string, boolean>>({});
+  const [isRangeModalVisible, setIsRangeModalVisible] = useState(false);
+  const [rangeSelection, setRangeSelection] = useState<MarketplaceOrdersRangeSelection>("start");
+  const [calendarCursor, setCalendarCursor] = useState(() => parseLocalDateKey(rangeStart));
+  const [areChartsVisible, setAreChartsVisible] = useState(() =>
+    readCookieBoolean(MARKETPLACE_ORDERS_CHARTS_VISIBLE_COOKIE, true)
+  );
+  const [selectedMetricChart, setSelectedMetricChart] = useState<MarketplaceOrdersMetricKey | null>(null);
+  const [hoveredMetricPoint, setHoveredMetricPoint] = useState<{
+    x: number;
+    y: number;
+    label: string;
+    value: number;
+    seriesLabel: string;
+    color: string;
+  } | null>(null);
+
+  useEffect(() => {
+    writeCookieBoolean(MARKETPLACE_ORDERS_CHARTS_VISIBLE_COOKIE, areChartsVisible);
+  }, [areChartsVisible]);
+
+  const normalizedRange = useMemo(() => {
+    const start = parseLocalDateKey(rangeStart);
+    const end = parseLocalDateKey(rangeEnd);
+    if (start.getTime() <= end.getTime()) {
+      return {
+        startKey: formatLocalDateKey(start),
+        endKey: formatLocalDateKey(end),
+        startDate: startOfLocalDay(start),
+        endDate: endOfLocalDay(end),
+      };
+    }
+
+    return {
+      startKey: formatLocalDateKey(end),
+      endKey: formatLocalDateKey(start),
+      startDate: startOfLocalDay(end),
+      endDate: endOfLocalDay(start),
+    };
+  }, [rangeStart, rangeEnd]);
+
+  const comparisonRange = useMemo(() => {
+    const durationDays =
+      Math.max(
+        0,
+        Math.round(
+          (startOfLocalDay(normalizedRange.endDate).getTime() - startOfLocalDay(normalizedRange.startDate).getTime()) /
+            (24 * 60 * 60 * 1000)
+        )
+      ) + 1;
+
+    if (comparisonMode === "same_30_days_before") {
+      const startDate = addLocalDays(normalizedRange.startDate, -30);
+      const endDate = addLocalDays(normalizedRange.endDate, -30);
+      return {
+        startDate: startOfLocalDay(startDate),
+        endDate: endOfLocalDay(endDate),
+        label: `${formatLocalDateKey(startDate)} até ${formatLocalDateKey(endDate)}`,
+      };
+    }
+
+    const endDate = addLocalDays(normalizedRange.startDate, -1);
+    const startDate = addLocalDays(endDate, -(durationDays - 1));
+    return {
+      startDate: startOfLocalDay(startDate),
+      endDate: endOfLocalDay(endDate),
+      label: `${formatLocalDateKey(startDate)} até ${formatLocalDateKey(endDate)}`,
+    };
+  }, [comparisonMode, normalizedRange]);
+
+  const logisticOptions = useMemo(() => {
+    const values = new Map<string, string>();
+    for (const order of orderItems) {
+      const raw = order.shipping_logistic_type || "__empty__";
+      values.set(
+        raw,
+        resolveMarketplaceNormalizedLabel(normalizationRules, "shipping_logistic_type", order.shipping_logistic_type, "Sem logística")
+      );
+    }
+    return Array.from(values.entries())
+      .map(([value, label]) => ({ value, label }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [orderItems, normalizationRules]);
+
+  const statusOptions = useMemo(() => {
+    const values = new Set<string>();
+    for (const order of orderItems) {
+      values.add(order.status || "Sem status");
+    }
+    return Array.from(values).sort((a, b) => a.localeCompare(b));
+  }, [orderItems]);
+
+  const isCancelledOrder = (order: MarketplaceOrderItem) => {
+    const status = `${order.status ?? ""} ${order.substatus ?? ""}`.toLowerCase();
+    return status.includes("cancel");
+  };
+
+  const filterOrder = (order: MarketplaceOrderItem, startDate: Date, endDate: Date) => {
+    const orderDate = new Date(order.date_created || order.updated_at || order.last_seen_at || "");
+    if (!Number.isFinite(orderDate.getTime())) return false;
+    if (orderDate.getTime() < startDate.getTime() || orderDate.getTime() > endDate.getTime()) return false;
+    if (hideCancelled && isCancelledOrder(order)) return false;
+    if (logisticFilter !== "__all__" && (order.shipping_logistic_type || "__empty__") !== logisticFilter) return false;
+    if (statusFilter !== "__all__" && (order.status || "Sem status") !== statusFilter) return false;
+    return true;
+  };
+
+  const summarizeOrders = (orders: MarketplaceOrderItem[]): MarketplaceOrdersSummary => {
+    const revenueCents = orders.reduce((sum, order) => sum + (order.metrics?.grossRevenueCents ?? 0), 0);
+    const productionCostCents = orders.reduce((sum, order) => sum + (order.metrics?.productionCostCents ?? 0), 0);
+    const unitsSold = orders.reduce((sum, order) => sum + (order.metrics?.unitsSold ?? 0), 0);
+    const grossProfitCents = orders.reduce((sum, order) => {
+      const baseReceived = order.metrics?.netReceivedCents ?? order.metrics?.grossRevenueCents ?? 0;
+      const productionCost = order.metrics?.productionCostCents ?? 0;
+      const estimatedTaxCents = Math.round((order.metrics?.grossRevenueCents ?? 0) * (taxRatePercent / 100));
+      return sum + baseReceived - productionCost - estimatedTaxCents;
+    }, 0);
+
+    return {
+      revenueCents,
+      productionCostCents,
+      ordersCount: orders.length,
+      averageTicketCents: orders.length > 0 ? Math.round(revenueCents / orders.length) : 0,
+      unitsSold,
+      grossProfitCents,
+    };
+  };
+
+  const currentOrders = useMemo(
+    () =>
+      orderItems
+        .filter((order) => filterOrder(order, normalizedRange.startDate, normalizedRange.endDate))
+        .sort((a, b) => Date.parse(b.date_created || b.updated_at || "") - Date.parse(a.date_created || a.updated_at || "")),
+    [orderItems, normalizedRange, logisticFilter, statusFilter, hideCancelled]
+  );
+
+  const comparisonOrders = useMemo(
+    () => orderItems.filter((order) => filterOrder(order, comparisonRange.startDate, comparisonRange.endDate)),
+    [orderItems, comparisonRange, logisticFilter, statusFilter, hideCancelled]
+  );
+
+  const currentSummary = useMemo(() => summarizeOrders(currentOrders), [currentOrders, taxRatePercent]);
+  const comparisonSummary = useMemo(() => summarizeOrders(comparisonOrders), [comparisonOrders, taxRatePercent]);
+  const logisticsChartColors = ["#1e3a79", "#0f766e", "#f59e0b", "#7c3aed", "#dc2626", "#4b5563"];
+  const accountsById = useMemo(() => {
+    const map = new Map<string, MarketplaceAccountStatus>();
+    for (const account of accounts) {
+      map.set(account.id, account);
+    }
+    return map;
+  }, [accounts]);
+  const logisticsDistribution = useMemo(() => {
+    const counts = new Map<string, { label: string; count: number; color: string }>();
+    for (const order of currentOrders) {
+      const raw = order.shipping_logistic_type || "__empty__";
+      const label = resolveMarketplaceNormalizedLabel(
+        normalizationRules,
+        "shipping_logistic_type",
+        order.shipping_logistic_type,
+        "Sem logística"
+      );
+      const current = counts.get(raw) ?? {
+        label,
+        count: 0,
+        color: logisticsChartColors[counts.size % logisticsChartColors.length],
+      };
+      current.count += 1;
+      counts.set(raw, current);
+    }
+
+    const total = currentOrders.length;
+    return Array.from(counts.values())
+      .sort((a, b) => b.count - a.count)
+      .map((item) => ({
+        ...item,
+        percent: total > 0 ? (item.count / total) * 100 : 0,
+      }));
+  }, [currentOrders, normalizationRules]);
+  const logisticsPieGradient = useMemo(() => {
+    if (logisticsDistribution.length === 0) return "#eef3ff";
+    let cursor = 0;
+    const stops = logisticsDistribution.map((item) => {
+      const start = cursor;
+      cursor += item.percent;
+      return `${item.color} ${start.toFixed(2)}% ${cursor.toFixed(2)}%`;
+    });
+    return `conic-gradient(${stops.join(", ")})`;
+  }, [logisticsDistribution]);
+  const accountDistribution = useMemo(() => {
+    const counts = new Map<string, { accountId: string; label: string; count: number; color: string }>();
+    for (const order of currentOrders) {
+      const account = accountsById.get(order.account_id);
+      const label = account?.seller_nickname || account?.account_label || account?.marketplace_user_id || order.account_id;
+      const current = counts.get(order.account_id) ?? {
+        accountId: order.account_id,
+        label,
+        count: 0,
+        color: logisticsChartColors[counts.size % logisticsChartColors.length],
+      };
+      current.count += 1;
+      counts.set(order.account_id, current);
+    }
+
+    const total = currentOrders.length;
+    return Array.from(counts.values())
+      .sort((a, b) => b.count - a.count)
+      .map((item) => ({
+        ...item,
+        percent: total > 0 ? (item.count / total) * 100 : 0,
+      }));
+  }, [accountsById, currentOrders]);
+  const accountPieGradient = useMemo(() => {
+    if (accountDistribution.length === 0) return "#eef3ff";
+    let cursor = 0;
+    const stops = accountDistribution.map((item) => {
+      const start = cursor;
+      cursor += item.percent;
+      return `${item.color} ${start.toFixed(2)}% ${cursor.toFixed(2)}%`;
+    });
+    return `conic-gradient(${stops.join(", ")})`;
+  }, [accountDistribution]);
+
+  const setQuickRange = (range: Exclude<MarketplaceOrdersQuickRange, null>) => {
+    const today = new Date();
+    const yesterday = addLocalDays(today, -1);
+    const end = range === "today" ? today : yesterday;
+    const start =
+      range === "today"
+        ? today
+        : range === "yesterday"
+          ? yesterday
+          : addLocalDays(yesterday, -(Number(range.replace("d", "")) - 1));
+    setRangeStart(formatLocalDateKey(start));
+    setRangeEnd(formatLocalDateKey(end));
+    setCalendarCursor(start);
+    setActiveQuickRange(range);
+  };
+
+  const renderComparison = (current: number, previous: number, formatter: (value: number) => string) => {
+    const deltaPercent = previous === 0 ? (current === 0 ? 0 : 100) : ((current - previous) / Math.abs(previous)) * 100;
+    const isPositive = deltaPercent >= 0;
+    return (
+      <>
+        <Text style={[styles.marketplaceMetricDelta, isPositive ? styles.marketplaceMetricDeltaPositive : styles.marketplaceMetricDeltaNegative]}>
+          {isPositive ? "+" : ""}
+          {deltaPercent.toLocaleString("pt-BR", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%
+        </Text>
+        <Text style={styles.marketplaceMetricPrevious}>Anterior: {formatter(previous)}</Text>
+      </>
+    );
+  };
+
+  const buildMetricSeries = (
+    orders: MarketplaceOrderItem[],
+    startDate: Date,
+    endDate: Date,
+    metricKey: MarketplaceOrdersMetricKey
+  ) => {
+    const buckets = new Map<
+      string,
+      {
+        revenueCents: number;
+        productionCostCents: number;
+        ordersCount: number;
+        unitsSold: number;
+      }
+    >();
+    const labels: string[] = [];
+    let cursor = startOfLocalDay(startDate);
+    const end = startOfLocalDay(endDate);
+    while (cursor.getTime() <= end.getTime()) {
+      const key = formatLocalDateKey(cursor);
+      buckets.set(key, { revenueCents: 0, productionCostCents: 0, ordersCount: 0, unitsSold: 0 });
+      labels.push(`${String(cursor.getDate()).padStart(2, "0")}/${String(cursor.getMonth() + 1).padStart(2, "0")}`);
+      cursor = addLocalDays(cursor, 1);
+    }
+
+    for (const order of orders) {
+      const orderDate = new Date(order.date_created || order.updated_at || order.last_seen_at || "");
+      if (!Number.isFinite(orderDate.getTime())) continue;
+      const key = formatLocalDateKey(orderDate);
+      const bucket = buckets.get(key);
+      if (!bucket) continue;
+      bucket.revenueCents += order.metrics?.grossRevenueCents ?? 0;
+      bucket.productionCostCents += order.metrics?.productionCostCents ?? 0;
+      bucket.ordersCount += 1;
+      bucket.unitsSold += order.metrics?.unitsSold ?? 0;
+    }
+
+    const values = Array.from(buckets.values()).map((bucket) => {
+      if (metricKey === "revenue") return bucket.revenueCents;
+      if (metricKey === "productionCost") return bucket.productionCostCents;
+      if (metricKey === "ordersCount") return bucket.ordersCount;
+      if (metricKey === "averageTicket") {
+        return bucket.ordersCount > 0 ? Math.round(bucket.revenueCents / bucket.ordersCount) : 0;
+      }
+      return bucket.unitsSold;
+    });
+
+    return { labels, values };
+  };
+
+  const metricCards = [
+    {
+      key: "revenue" as const,
+      label: "Faturado",
+      value: money(currentSummary.revenueCents),
+      previousValue: comparisonSummary.revenueCents,
+      currentValue: currentSummary.revenueCents,
+      formatter: money,
+    },
+    {
+      key: "productionCost" as const,
+      label: "Custo produtos",
+      value: money(currentSummary.productionCostCents),
+      previousValue: comparisonSummary.productionCostCents,
+      currentValue: currentSummary.productionCostCents,
+      formatter: money,
+    },
+    {
+      key: "ordersCount" as const,
+      label: "Vendas",
+      value: String(currentSummary.ordersCount),
+      previousValue: comparisonSummary.ordersCount,
+      currentValue: currentSummary.ordersCount,
+      formatter: (value: number) => String(value),
+    },
+    {
+      key: "averageTicket" as const,
+      label: "Ticket médio",
+      value: money(currentSummary.averageTicketCents),
+      previousValue: comparisonSummary.averageTicketCents,
+      currentValue: currentSummary.averageTicketCents,
+      formatter: money,
+    },
+    {
+      key: "unitsSold" as const,
+      label: "Itens vendidos",
+      value: String(currentSummary.unitsSold),
+      previousValue: comparisonSummary.unitsSold,
+      currentValue: currentSummary.unitsSold,
+      formatter: (value: number) => String(value),
+    },
+  ];
+  const selectedMetric = metricCards.find((metric) => metric.key === selectedMetricChart) ?? null;
+  const metricChartData = useMemo(() => {
+    if (!selectedMetricChart) return null;
+    const current = buildMetricSeries(currentOrders, normalizedRange.startDate, normalizedRange.endDate, selectedMetricChart);
+    const previous = buildMetricSeries(comparisonOrders, comparisonRange.startDate, comparisonRange.endDate, selectedMetricChart);
+    return {
+      current,
+      previous,
+      maxValue: Math.max(1, ...current.values, ...previous.values),
+      minValue: Math.min(...current.values, ...previous.values),
+    };
+  }, [selectedMetricChart, currentOrders, comparisonOrders, normalizedRange, comparisonRange]);
+  const metricChartWidth = 680;
+  const metricChartHeight = 180;
+  const stockPendingItems = useMemo(() => {
+    const items: Array<{
+      order: MarketplaceOrderItem;
+      item: MarketplaceOrderItem["order_items"][number];
+    }> = [];
+    for (const order of currentOrders) {
+      for (const item of order.order_items) {
+        const code = item.stock_status?.code;
+        if (code === "missing_sku" || code === "pending_movement") {
+          items.push({ order, item });
+        }
+      }
+    }
+    return items;
+  }, [currentOrders]);
+  const stockStatusCounts = useMemo(() => {
+    const counts = {
+      missing_sku: 0,
+      pending_movement: 0,
+      moved: 0,
+      ignored_fulfillment: 0,
+      ignored_cancelled: 0,
+    };
+    for (const order of currentOrders) {
+      for (const item of order.order_items) {
+        const code = item.stock_status?.code;
+        if (code && code in counts) {
+          counts[code as keyof typeof counts] += 1;
+        }
+      }
+    }
+    return counts;
+  }, [currentOrders]);
+  const renderMetricLine = (
+    values: number[],
+    labels: string[],
+    maxValue: number,
+    minValue: number,
+    color: string,
+    seriesLabel: string,
+    opacity = 1
+  ) => {
+    const valueRange = Math.max(1, maxValue - minValue);
+    const xStep = values.length > 1 ? metricChartWidth / (values.length - 1) : 0;
+    const points = values.map((value, index) => ({
+      x: values.length > 1 ? index * xStep : metricChartWidth / 2,
+      y: metricChartHeight - ((value - minValue) / valueRange) * metricChartHeight,
+      value,
+      label: labels[index] ?? "",
+    }));
+
+    return (
+      <>
+        {points.slice(1).map((point, index) => {
+          const previous = points[index];
+          const dx = point.x - previous.x;
+          const dy = point.y - previous.y;
+          const length = Math.sqrt(dx * dx + dy * dy);
+          const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+          return (
+            <View
+              key={`${color}-${index}`}
+              style={[
+                styles.marketplaceMetricChartSegment,
+                {
+                  left: (previous.x + point.x) / 2 - length / 2,
+                  top: (previous.y + point.y) / 2 - 1.5,
+                  width: length,
+                  backgroundColor: color,
+                  opacity,
+                  transform: [{ rotate: `${angle}deg` }],
+                },
+              ]}
+            />
+          );
+        })}
+        {points.map((point, index) => (
+          <Pressable
+            key={`${color}-dot-${index}`}
+            onHoverIn={() => setHoveredMetricPoint({ ...point, seriesLabel, color })}
+            onHoverOut={() => setHoveredMetricPoint(null)}
+            onPressIn={() => setHoveredMetricPoint({ ...point, seriesLabel, color })}
+            style={[
+              styles.marketplaceMetricChartDot,
+              {
+                left: point.x - 4,
+                top: point.y - 4,
+                backgroundColor: color,
+                opacity,
+              },
+            ]}
+          />
+        ))}
+      </>
+    );
+  };
+
+  const calendarCells = buildCalendarCells(calendarCursor);
+  const monthLabel = `${calendarCursor.toLocaleString("pt-BR", { month: "long" })} ${calendarCursor.getFullYear()}`;
+
+  return (
+    <Section title="Dashboard de pedidos">
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Período</Text>
+        <View style={styles.row}>
+          <Pressable
+            style={styles.selectTrigger}
+            onPress={() => {
+              setRangeSelection("start");
+              setCalendarCursor(parseLocalDateKey(normalizedRange.startKey));
+              setIsRangeModalVisible(true);
+            }}
+          >
+            <Text style={styles.selectValueText}>{normalizedRange.startKey} até {normalizedRange.endKey}</Text>
+          </Pressable>
+	          {[
+	            { key: "today" as const, label: "Hoje" },
+	            { key: "yesterday" as const, label: "Ontem" },
+	            { key: "7d" as const, label: "7 dias" },
+	            { key: "15d" as const, label: "15 dias" },
+	            { key: "30d" as const, label: "30 dias" },
+	          ].map((quickRange) => (
+	            <AppButton
+	              key={quickRange.key}
+	              label={quickRange.label}
+	              variant="small"
+	              active={activeQuickRange === quickRange.key}
+	              onPress={() => setQuickRange(quickRange.key)}
+	            />
+	          ))}
+	          <AppButton
+	            label="Período anterior"
+	            variant="small"
+	            active={comparisonMode === "previous"}
+	            onPress={() => setComparisonMode("previous")}
+	          />
+	          <AppButton
+	            label="30 dias antes"
+	            variant="small"
+	            active={comparisonMode === "same_30_days_before"}
+	            onPress={() => setComparisonMode("same_30_days_before")}
+	          />
+        </View>
+        <Text style={styles.text}>Comparando com: {comparisonRange.label}</Text>
+      </View>
+
+      <View style={styles.marketplaceMetricGrid}>
+        {metricCards.map((metric) => (
+          <Pressable
+            key={metric.key}
+            style={[
+              styles.marketplaceMetricCard,
+              selectedMetricChart === metric.key && styles.marketplaceMetricCardActive,
+            ]}
+            onPress={() => setSelectedMetricChart((current) => (current === metric.key ? null : metric.key))}
+          >
+            <Text style={styles.marketplaceMetricLabel}>{metric.label}</Text>
+            <Text style={styles.marketplaceMetricValue}>{metric.value}</Text>
+            {renderComparison(metric.currentValue, metric.previousValue, metric.formatter)}
+          </Pressable>
+        ))}
+      </View>
+
+      {selectedMetric && metricChartData ? (
+        <View style={styles.card}>
+          <View style={styles.marketplaceMetricChartHeader}>
+            <View>
+              <Text style={styles.cardTitle}>{selectedMetric.label} por dia</Text>
+              <Text style={styles.text}>Atual vs. {comparisonRange.label}</Text>
+            </View>
+            <Text style={styles.marketplaceMetricChartScale}>
+              {selectedMetric.formatter(metricChartData.minValue)} - {selectedMetric.formatter(metricChartData.maxValue)}
+            </Text>
+          </View>
+          <View style={styles.marketplaceMetricChartLegend}>
+            <View style={styles.marketplaceLogisticsLegendItem}>
+              <View style={[styles.marketplaceLogisticsLegendSwatch, { backgroundColor: "#1e3a79" }]} />
+              <Text style={styles.text}>Período selecionado</Text>
+            </View>
+            <View style={styles.marketplaceLogisticsLegendItem}>
+              <View style={[styles.marketplaceLogisticsLegendSwatch, { backgroundColor: "#93b4ef" }]} />
+              <Text style={styles.text}>Período anterior</Text>
+            </View>
+          </View>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.marketplaceMetricChartScrollContent}>
+            <View style={styles.marketplaceMetricChartLayout}>
+              <View style={[styles.marketplaceMetricChartScaleAxis, { height: metricChartHeight }]}>
+                <Text style={styles.marketplaceMetricChartAxisText}>{selectedMetric.formatter(metricChartData.maxValue)}</Text>
+                <Text style={styles.marketplaceMetricChartAxisText}>
+                  {selectedMetric.formatter(Math.round((metricChartData.maxValue + metricChartData.minValue) / 2))}
+                </Text>
+                <Text style={styles.marketplaceMetricChartAxisText}>{selectedMetric.formatter(metricChartData.minValue)}</Text>
+              </View>
+              <View style={styles.marketplaceMetricChartFrame}>
+                <View style={styles.marketplaceMetricChartGridLineTop} />
+                <View style={styles.marketplaceMetricChartGridLineMiddle} />
+                <View style={styles.marketplaceMetricChartGridLineBottom} />
+                <View style={[styles.marketplaceMetricChartCanvas, { width: metricChartWidth, height: metricChartHeight }]}>
+                  {renderMetricLine(
+                    metricChartData.previous.values,
+                    metricChartData.previous.labels,
+                    metricChartData.maxValue,
+                    metricChartData.minValue,
+                    "#93b4ef",
+                    "Período anterior",
+                    0.9
+                  )}
+                  {renderMetricLine(
+                    metricChartData.current.values,
+                    metricChartData.current.labels,
+                    metricChartData.maxValue,
+                    metricChartData.minValue,
+                    "#1e3a79",
+                    "Período selecionado",
+                    1
+                  )}
+                  {hoveredMetricPoint ? (
+                    <View
+                      pointerEvents="none"
+                      style={[
+                        styles.marketplaceMetricChartTooltip,
+                        {
+                          left: Math.min(Math.max(hoveredMetricPoint.x - 74, 0), metricChartWidth - 148),
+                          top: Math.max(hoveredMetricPoint.y - 58, 0),
+                          borderColor: hoveredMetricPoint.color,
+                        },
+                      ]}
+                    >
+                      <Text style={styles.marketplaceMetricChartTooltipTitle}>{hoveredMetricPoint.seriesLabel}</Text>
+                      <Text style={styles.marketplaceMetricChartTooltipText}>
+                        {hoveredMetricPoint.label}: {selectedMetric.formatter(hoveredMetricPoint.value)}
+                      </Text>
+                    </View>
+                  ) : null}
+                </View>
+                <View style={[styles.marketplaceMetricChartAxis, { width: metricChartWidth }]}>
+                  <Text style={styles.marketplaceMetricChartAxisText}>{metricChartData.current.labels[0] ?? ""}</Text>
+                  <Text style={styles.marketplaceMetricChartAxisText}>
+                    {metricChartData.current.labels[metricChartData.current.labels.length - 1] ?? ""}
+                  </Text>
+                </View>
+              </View>
+            </View>
+          </ScrollView>
+        </View>
+      ) : null}
+
+      <View style={styles.row}>
+        <AppButton
+          label={areChartsVisible ? "-" : "+"}
+          variant="small"
+          active={areChartsVisible}
+          onPress={() => setAreChartsVisible((prev) => !prev)}
+          style={styles.marketplaceChartsToggleButton}
+          textStyle={styles.marketplaceChartsToggleButtonText}
+        />
+      </View>
+
+      {areChartsVisible && <View style={styles.marketplaceChartsGrid}>
+        <View style={[styles.card, styles.marketplaceChartCard]}>
+          <Text style={styles.cardTitle}>Pedidos por logística</Text>
+          {logisticsDistribution.length === 0 ? (
+            <Text style={styles.text}>Nenhum pedido encontrado para o período e filtros atuais.</Text>
+          ) : (
+            <View style={styles.marketplaceLogisticsChartWrap}>
+              <View style={styles.marketplaceLogisticsPieOuter}>
+                <View
+                  style={[
+                    styles.marketplaceLogisticsPie,
+                    Platform.OS === "web"
+                      ? ({ backgroundImage: logisticsPieGradient } as ViewStyle & { backgroundImage: string })
+                      : { backgroundColor: logisticsDistribution[0]?.color ?? "#eef3ff" },
+                  ]}
+                >
+                  <View style={styles.marketplaceLogisticsPieCenter}>
+                    <Text style={styles.marketplaceLogisticsPieTotal}>{currentOrders.length}</Text>
+                    <Text style={styles.marketplaceLogisticsPieLabel}>pedidos</Text>
+                  </View>
+                </View>
+              </View>
+              <View style={styles.marketplaceLogisticsLegend}>
+                {logisticsDistribution.map((item) => (
+                  <View key={item.label} style={styles.marketplaceLogisticsLegendItem}>
+                    <View style={[styles.marketplaceLogisticsLegendSwatch, { backgroundColor: item.color }]} />
+                    <Text style={styles.text}>
+                      {item.label}: {item.count} ({item.percent.toLocaleString("pt-BR", {
+                        minimumFractionDigits: 1,
+                        maximumFractionDigits: 1,
+                      })}
+                      %)
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+          )}
+        </View>
+
+        <View style={[styles.card, styles.marketplaceChartCard]}>
+          <Text style={styles.cardTitle}>Pedidos por conta</Text>
+          {accountDistribution.length === 0 ? (
+            <Text style={styles.text}>Nenhum pedido encontrado para o período e filtros atuais.</Text>
+          ) : (
+            <View style={styles.marketplaceLogisticsChartWrap}>
+              <View style={styles.marketplaceLogisticsPieOuter}>
+                <View
+                  style={[
+                    styles.marketplaceLogisticsPie,
+                    Platform.OS === "web"
+                      ? ({ backgroundImage: accountPieGradient } as ViewStyle & { backgroundImage: string })
+                      : { backgroundColor: accountDistribution[0]?.color ?? "#eef3ff" },
+                  ]}
+                >
+                  <View style={styles.marketplaceLogisticsPieCenter}>
+                    <Text style={styles.marketplaceLogisticsPieTotal}>{currentOrders.length}</Text>
+                    <Text style={styles.marketplaceLogisticsPieLabel}>pedidos</Text>
+                  </View>
+                </View>
+              </View>
+              <View style={styles.marketplaceLogisticsLegend}>
+                {accountDistribution.map((item) => (
+                  <View key={item.accountId} style={styles.marketplaceLogisticsLegendItem}>
+                    <View style={[styles.marketplaceLogisticsLegendSwatch, { backgroundColor: item.color }]} />
+                    <Text style={styles.text}>
+                      {maskSensitiveText(item.label, isPrivacyMode, PRIVACY_MASK)}: {item.count} ({item.percent.toLocaleString("pt-BR", {
+                        minimumFractionDigits: 1,
+                        maximumFractionDigits: 1,
+                      })}
+                      %)
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+          )}
+        </View>
+      </View>}
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Filtros</Text>
+        <View style={styles.row}>
+          <View style={styles.marketplaceFilterGroup}>
+            <Text style={styles.fieldLabel}>Logística</Text>
+            <View style={styles.row}>
+	              <AppButton
+	                label="Todas"
+	                variant="small"
+	                active={logisticFilter === "__all__"}
+	                onPress={() => setLogisticFilter("__all__")}
+	              />
+              {logisticOptions.map((option) => (
+                <AppButton
+                  key={option.value}
+                  label={option.label}
+                  variant="small"
+                  active={logisticFilter === option.value}
+                  onPress={() => setLogisticFilter(option.value)}
+                />
+              ))}
+            </View>
+          </View>
+
+          <View style={styles.marketplaceFilterGroup}>
+            <Text style={styles.fieldLabel}>Status</Text>
+            <View style={styles.row}>
+	              <AppButton
+	                label="Todos"
+	                variant="small"
+	                active={statusFilter === "__all__"}
+	                onPress={() => setStatusFilter("__all__")}
+	              />
+	              {statusOptions.map((option) => (
+	                <AppButton
+	                  key={option}
+	                  label={option}
+	                  variant="small"
+	                  active={statusFilter === option}
+	                  onPress={() => setStatusFilter(option)}
+	                />
+	              ))}
+            </View>
+          </View>
+
+	          <AppButton
+	            label="Esconder canceladas"
+	            variant="small"
+	            active={hideCancelled}
+	            onPress={() => setHideCancelled((prev) => !prev)}
+	          />
+	          <AppButton
+	            label="Recalcular snapshots"
+	            variant="small"
+	            onPress={onRecalculateAllOrderSnapshots}
+	            disabled={isBusy}
+	          />
+        </View>
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Pendências de estoque marketplace</Text>
+        <View style={styles.marketplaceStockStatusGrid}>
+          <View style={styles.marketplaceStockStatusPill}>
+            <Text style={styles.marketplaceMetricLabel}>Sem SKU</Text>
+            <Text style={styles.marketplaceStockStatusValue}>{stockStatusCounts.missing_sku}</Text>
+          </View>
+          <View style={styles.marketplaceStockStatusPill}>
+            <Text style={styles.marketplaceMetricLabel}>Baixa pendente</Text>
+            <Text style={styles.marketplaceStockStatusValue}>{stockStatusCounts.pending_movement}</Text>
+          </View>
+          <View style={styles.marketplaceStockStatusPill}>
+            <Text style={styles.marketplaceMetricLabel}>Baixados</Text>
+            <Text style={styles.marketplaceStockStatusValue}>{stockStatusCounts.moved}</Text>
+          </View>
+          <View style={styles.marketplaceStockStatusPill}>
+            <Text style={styles.marketplaceMetricLabel}>Fulfillment ignorado</Text>
+            <Text style={styles.marketplaceStockStatusValue}>{stockStatusCounts.ignored_fulfillment}</Text>
+          </View>
+        </View>
+        {stockPendingItems.length === 0 ? (
+          <Text style={styles.text}>Nenhuma pendência de estoque nos pedidos filtrados.</Text>
+        ) : (
+          <View style={styles.marketplaceStockPendingList}>
+            {stockPendingItems.map(({ order, item }) => (
+              <View key={item.id} style={styles.marketplaceStockPendingItem}>
+                <View style={styles.marketplaceStockPendingText}>
+                  <Text style={styles.text}>
+                    {item.stock_status?.label ?? "Pendente"} | Pedido{" "}
+                    {maskSensitiveText(order.marketplace_order_id, isPrivacyMode, PRIVACY_MASK)}
+                  </Text>
+                  <Text style={styles.text}>{maskSensitiveText(item.title, isPrivacyMode, PRIVACY_MASK)}</Text>
+                  <Text style={styles.marketplaceMetricPrevious}>
+                    Qtd: {item.quantity} | Esperado: {item.stock_status?.expected_delta ?? 0} | Movido:{" "}
+                    {item.stock_status?.moved_delta ?? 0}
+                  </Text>
+                  <Text style={styles.marketplaceMetricPrevious}>{item.stock_status?.summary ?? "-"}</Text>
+                </View>
+                {item.stock_status?.code === "missing_sku" ? (
+                  <AppButton
+                    label="Vincular SKU"
+                    variant="small"
+                    active
+                    onPress={() =>
+                      onOpenSkuLinking({
+                        accountId: order.account_id,
+                        marketplaceItemId: item.marketplace_item_id,
+                        marketplaceVariationId: item.effective_marketplace_variation_id,
+                        variationKey: item.effective_variation_key,
+                        catalogVariationId: item.current_linked_catalog_variation_id,
+                      })
+                    }
+                  />
+                ) : (
+                  <AppButton
+                    label="Recalcular pedido"
+                    variant="small"
+                    onPress={() => onRecalculateSingleOrderSnapshot(order.id)}
+                    disabled={isBusy}
+                  />
+                )}
+              </View>
+            ))}
+          </View>
+        )}
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Pedidos filtrados ({currentOrders.length})</Text>
+        {currentOrders.length === 0 ? (
+          <Text style={styles.text}>Nenhum pedido encontrado para o período e filtros atuais.</Text>
+        ) : (
+          currentOrders.map((order) => {
+            const isExpanded = Boolean(expandedOrderIds[order.id]);
+            const baseReceived = order.metrics?.netReceivedCents ?? order.metrics?.grossRevenueCents ?? 0;
+            const estimatedTaxCents = Math.round((order.metrics?.grossRevenueCents ?? 0) * (taxRatePercent / 100));
+            const grossProfitCents = baseReceived - (order.metrics?.productionCostCents ?? 0) - estimatedTaxCents;
+
+            return (
+              <Pressable
+                key={order.id}
+                style={styles.marketplaceCompactOrderCard}
+                onPress={() => setExpandedOrderIds((prev) => ({ ...prev, [order.id]: !isExpanded }))}
+              >
+                <View style={styles.marketplaceCompactOrderHeader}>
+                  <View style={styles.marketplaceCompactOrderBuyer}>
+                    <Text style={styles.cardTitle}>
+                      {maskSensitiveText(order.buyer_nickname || order.buyer_id || "Comprador não informado", isPrivacyMode, PRIVACY_MASK)}
+                    </Text>
+                    <Text style={styles.text}>Pedido {maskSensitiveText(order.marketplace_order_id, isPrivacyMode, PRIVACY_MASK)}</Text>
+                  </View>
+                  <View style={styles.marketplaceCompactOrderNumbers}>
+                    <Text style={styles.marketplaceOrderRevenue}>{money(order.metrics?.grossRevenueCents ?? 0)}</Text>
+                    <Text style={grossProfitCents >= 0 ? styles.marketplaceOrderProfitPositive : styles.marketplaceOrderProfitNegative}>
+                      Lucro {money(grossProfitCents)}
+                    </Text>
+                  </View>
+                </View>
+
+                {isExpanded ? (
+                  <View style={styles.marketplaceOrderDetails}>
+                    <View style={styles.row}>
+	                      <AppButton
+	                        label="Recalcular pedido"
+	                        variant="small"
+	                        onPress={() => onRecalculateSingleOrderSnapshot(order.id)}
+	                        disabled={isBusy}
+	                      />
+                    </View>
+                    <Text style={styles.text}>Status: {order.status || "-"} {order.substatus ? `(${order.substatus})` : ""}</Text>
+                    <Text style={styles.text}>
+                      Logística:{" "}
+                      {resolveMarketplaceNormalizedLabel(
+                        normalizationRules,
+                        "shipping_logistic_type",
+                        order.shipping_logistic_type,
+                        "-"
+                      )}{" "}
+                      | Modo: {order.shipping_mode || "-"} | Tipo: {order.shipping_type || "-"}
+                    </Text>
+                    <Text style={styles.text}>Envio: {order.shipping_status || "-"} {order.shipping_substatus ? `(${order.shipping_substatus})` : ""} | Etapa: {shippingStageLabel(order.shipping_stage)}</Text>
+                    <Text style={styles.text}>Data: {dateTime(order.date_created || order.updated_at || "")}</Text>
+                    <Text style={styles.text}>Faturado: {money(order.metrics?.grossRevenueCents ?? 0)}</Text>
+                    <Text style={styles.text}>Recebido ML: {order.metrics?.netReceivedCents !== null && order.metrics?.netReceivedCents !== undefined ? money(order.metrics.netReceivedCents) : "Aguardando consolidação"}</Text>
+                    <Text style={styles.text}>Taxa ML: {order.ml_fee_total_cents !== null ? money(order.ml_fee_total_cents) : "-"}</Text>
+                    <Text style={styles.text}>Frete: {order.shipping_cost_cents !== null ? money(order.shipping_cost_cents) : "-"} | Compensação: {order.shipping_compensation_cents !== null ? money(order.shipping_compensation_cents) : "-"}</Text>
+                    <Text style={styles.text}>Imposto estimado ({taxRatePercent.toFixed(2)}%): {money(estimatedTaxCents)}</Text>
+                    <Text style={styles.text}>Custo dos produtos: {money(order.metrics?.productionCostCents ?? 0)}</Text>
+                    <Text style={styles.text}>Itens vendidos: {order.metrics?.unitsSold ?? 0}</Text>
+                    <Text style={styles.text}>Snapshot: {order.snapshot_status?.label ?? "Sem status"} - {order.snapshot_status?.summary ?? "-"}</Text>
+                    <Text style={styles.cardTitle}>Itens</Text>
+	                    {order.order_items.map((item) => {
+	                      const hasLinkedSku = Boolean(item.current_linked_sku_id);
+	                      return (
+	                        <View
+	                          key={item.id}
+	                          style={[
+	                            styles.marketplaceOrderItemCompact,
+	                            !hasLinkedSku && styles.marketplaceOrderItemMissingSku,
+	                          ]}
+	                        >
+	                          <Text style={styles.text}>{maskSensitiveText(item.title, isPrivacyMode, PRIVACY_MASK)}</Text>
+	                          <Text style={styles.text}>
+	                            Qtd: {item.quantity} | SKU:{" "}
+	                            {hasLinkedSku
+	                              ? maskSensitiveComposite(
+	                                  [item.current_linked_sku_code, item.current_linked_sku_name],
+	                                  isPrivacyMode,
+	                                  "SKU vinculado"
+	                                )
+	                              : "Sem SKU vinculado"}
+	                          </Text>
+                            <Text style={styles.marketplaceMetricPrevious}>
+                              Estoque: {item.stock_status?.label ?? "Sem status"} - {item.stock_status?.summary ?? "-"}
+                            </Text>
+	                          {!hasLinkedSku ? (
+	                            <View style={styles.marketplaceMissingSkuActions}>
+	                              <Text style={styles.marketplaceMissingSkuText}>
+	                                Este SKU do marketplace ainda não possui SKU local vinculado.
+	                              </Text>
+	                              <AppButton
+	                                label="Vincular SKU"
+	                                variant="small"
+	                                active
+	                                onPress={() =>
+	                                  onOpenSkuLinking({
+	                                    accountId: order.account_id,
+	                                    marketplaceItemId: item.marketplace_item_id,
+	                                    marketplaceVariationId: item.effective_marketplace_variation_id,
+	                                    variationKey: item.effective_variation_key,
+	                                    catalogVariationId: item.current_linked_catalog_variation_id,
+	                                  })
+	                                }
+	                              />
+	                            </View>
+	                          ) : null}
+	                        </View>
+	                      );
+	                    })}
+                  </View>
+                ) : null}
+              </Pressable>
+            );
+          })
+        )}
+      </View>
+
+      <Modal
+        transparent
+        visible={isRangeModalVisible}
+        animationType="fade"
+        onRequestClose={() => setIsRangeModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalBox}>
+            <Text style={styles.modalTitle}>Selecionar período</Text>
+            <View style={styles.row}>
+	              <AppButton
+	                label={`Inicial: ${rangeStart}`}
+	                variant="small"
+	                active={rangeSelection === "start"}
+	                onPress={() => {
+	                  setRangeSelection("start");
+	                  setCalendarCursor(parseLocalDateKey(rangeStart));
+	                }}
+	              />
+	              <AppButton
+	                label={`Final: ${rangeEnd}`}
+	                variant="small"
+	                active={rangeSelection === "end"}
+	                onPress={() => {
+	                  setRangeSelection("end");
+	                  setCalendarCursor(parseLocalDateKey(rangeEnd));
+	                }}
+	              />
+            </View>
+            <View style={styles.calendarHeaderRow}>
+	              <AppButton label="<" variant="small" onPress={() => setCalendarCursor((prev) => new Date(prev.getFullYear(), prev.getMonth() - 1, 1))} />
+	              <Text style={styles.calendarMonthLabel}>{monthLabel}</Text>
+	              <AppButton label=">" variant="small" onPress={() => setCalendarCursor((prev) => new Date(prev.getFullYear(), prev.getMonth() + 1, 1))} />
+            </View>
+            <View style={styles.calendarGrid}>
+              {WEEK_DAYS.map((dayName) => (
+                <Text key={dayName} style={styles.calendarWeekDay}>{dayName}</Text>
+              ))}
+              {calendarCells.map((cell, index) => {
+                if (!cell) return <View key={`orders-empty-${index}`} style={styles.calendarDayEmpty} />;
+                const dayKey = formatLocalDateKey(cell);
+                const time = startOfLocalDay(cell).getTime();
+                const inRange = time >= normalizedRange.startDate.getTime() && time <= normalizedRange.endDate.getTime();
+                const isEdge = dayKey === normalizedRange.startKey || dayKey === normalizedRange.endKey;
+                return (
+                  <Pressable
+                    key={`orders-${dayKey}`}
+                    style={[
+                      styles.calendarDayButton,
+                      inRange && styles.marketplaceCalendarDayInRange,
+                      isEdge && styles.calendarDayButtonSelected,
+                    ]}
+	                    onPress={() => {
+	                      setActiveQuickRange(null);
+	                      if (rangeSelection === "start") {
+	                        setRangeStart(dayKey);
+                        setRangeSelection("end");
+                      } else {
+                        setRangeEnd(dayKey);
+                        setRangeSelection("start");
+                      }
+                    }}
+                  >
+                    <Text style={[styles.calendarDayText, isEdge && styles.calendarDayTextSelected]}>{cell.getDate()}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <Text style={styles.modalMessage}>Período: {normalizedRange.startKey} até {normalizedRange.endKey}</Text>
+            <View style={styles.row}>
+	              <AppButton label="Fechar" variant="secondary" onPress={() => setIsRangeModalVisible(false)} />
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </Section>
   );
 }
 
 function MarketplacesScreen({
   status,
+  shopeeStatus,
   catalogVariationItems,
   orderItems,
+  ordersDashboard,
+  normalizationRules,
   onStartMercadoLivreAuth,
+  onStartShopeeAuth,
   onRefreshStatus,
+  onRefreshShopeeStatus,
   onSyncCatalog,
   onSyncOrders,
   onDisconnectAll,
+  onDisconnectShopee,
   onSetListingIgnored,
+  onSaveNormalizationRules,
   onRunCustomRequest,
   isBusy,
   infoMessage,
   isPrivacyMode,
 }: {
   status: MarketplaceStatusResponse | null;
+  shopeeStatus: MarketplaceStatusResponse | null;
   catalogVariationItems: MarketplaceCatalogVariationItem[];
   orderItems: MarketplaceOrderItem[];
+  ordersDashboard: MarketplaceOrdersDashboardResponse | null;
+  normalizationRules: MarketplaceNormalizationRule[];
   onStartMercadoLivreAuth: () => void;
+  onStartShopeeAuth: () => void;
   onRefreshStatus: () => void;
+  onRefreshShopeeStatus: () => void;
   onSyncCatalog: (accountId?: string) => void;
-  onSyncOrders: (accountId?: string) => void;
+  onSyncOrders: (accountId: string | undefined, mode: MarketplaceOrdersSyncMode) => void;
   onDisconnectAll: () => void;
+  onDisconnectShopee: () => void;
   onSetListingIgnored: (listingId: string, isIgnored: boolean) => Promise<void>;
+  onSaveNormalizationRules: (rules: Array<{ raw_value: string; normalized_label: string; is_active: boolean }>) => Promise<void>;
   onRunCustomRequest: (params: {
     accountId: string;
     method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -4396,6 +5882,9 @@ function MarketplacesScreen({
   const marketplaceConnected = status?.connected ?? false;
   const accounts = status?.accounts ?? [];
   const refreshErrors = status?.refresh_errors ?? [];
+  const shopeeConfigured = shopeeStatus?.configured ?? false;
+  const shopeeConnected = shopeeStatus?.connected ?? false;
+  const shopeeAccounts = shopeeStatus?.accounts ?? [];
   const [showDiagnostics, setShowDiagnostics] = useState(true);
   const [showCatalogByAccount, setShowCatalogByAccount] = useState<Record<string, boolean>>({});
   const [showOrdersByAccount, setShowOrdersByAccount] = useState<Record<string, boolean>>({});
@@ -4408,6 +5897,18 @@ function MarketplacesScreen({
   const [requestErrorByAccount, setRequestErrorByAccount] = useState<Record<string, string | null>>({});
   const [listingIgnoreSavingById, setListingIgnoreSavingById] = useState<Record<string, boolean>>({});
   const [listingIgnoreErrorById, setListingIgnoreErrorById] = useState<Record<string, string | null>>({});
+  const [normalizationDraft, setNormalizationDraft] = useState<Record<string, string>>({});
+  const [isSavingNormalization, setIsSavingNormalization] = useState(false);
+
+  useEffect(() => {
+    setNormalizationDraft(
+      Object.fromEntries(
+        normalizationRules
+          .filter((rule) => rule.category === "shipping_logistic_type")
+          .map((rule) => [rule.raw_value, rule.normalized_label])
+      )
+    );
+  }, [normalizationRules]);
 
   const handleRunCustomRequest = (accountId: string) => {
     void (async () => {
@@ -4530,6 +6031,89 @@ function MarketplacesScreen({
         </View>
       </Section>
 
+      <Section title="Shopee">
+        {!shopeeConfigured ? (
+          <View style={styles.errorBannerInline}>
+            <Text style={styles.errorText}>
+              Backend não configurado. Defina SHOPEE_PARTNER_ID, SHOPEE_PARTNER_KEY e SHOPEE_REDIRECT_URI no backend/.env.
+            </Text>
+          </View>
+        ) : null}
+
+        <Text style={styles.text}>Status da integração: {shopeeConnected ? "Conectado" : "Não conectado"}</Text>
+        <Text style={styles.text}>Lojas ativas: {shopeeAccounts.length}</Text>
+        {shopeeAccounts.map((account) => (
+          <View key={account.id} style={styles.card}>
+            <Text style={styles.cardTitle}>
+              {maskSensitiveText(account.seller_nickname || `Shopee ${account.marketplace_user_id}`, isPrivacyMode, PRIVACY_MASK)}
+            </Text>
+            <Text style={styles.text}>
+              Shop ID: {maskSensitiveText(account.marketplace_user_id, isPrivacyMode, PRIVACY_MASK)}
+            </Text>
+            <Text style={styles.text}>Token: {account.token_status}</Text>
+            <Text style={styles.text}>Conectado em: {dateTime(account.last_connected_at || "")}</Text>
+          </View>
+        ))}
+
+        <View style={styles.row}>
+          <AppButton
+            label="Iniciar autorização Shopee"
+            variant="primary"
+            onPress={onStartShopeeAuth}
+            disabled={isBusy}
+          />
+          <AppButton
+            label="Atualizar Shopee"
+            variant="secondary"
+            onPress={onRefreshShopeeStatus}
+            disabled={isBusy}
+          />
+          <AppButton
+            label="Desconectar Shopee"
+            variant="danger"
+            onPress={onDisconnectShopee}
+            disabled={isBusy || shopeeAccounts.length === 0}
+          />
+        </View>
+      </Section>
+
+      <Section title="Normalização de nomes">
+        <Text style={styles.text}>Tipos de logística do Mercado Livre exibidos nos dashboards e filtros.</Text>
+        {["drop_off", "fullfilment", "fulfillment", "self_service", "xd_drop_off"].map((rawValue) => (
+          <Field
+            key={rawValue}
+            label={rawValue}
+            value={normalizationDraft[rawValue] ?? ""}
+            onChangeText={(value) => setNormalizationDraft((prev) => ({ ...prev, [rawValue]: value }))}
+          />
+        ))}
+        <View style={styles.row}>
+          <AppButton
+            label={isSavingNormalization ? "Salvando..." : "Salvar normalização"}
+            variant="primary"
+            disabled={isSavingNormalization}
+            onPress={() => {
+              void (async () => {
+                try {
+                  setIsSavingNormalization(true);
+                  await onSaveNormalizationRules(
+                    Object.entries(normalizationDraft)
+                      .filter(([rawValue, label]) => rawValue.trim() && label.trim())
+                      .map(([rawValue, label]) => ({
+                        raw_value: rawValue.trim(),
+                        normalized_label: label.trim(),
+                        is_active: true,
+                      }))
+                  );
+                } finally {
+                  setIsSavingNormalization(false);
+                }
+              })();
+            }}
+          />
+        </View>
+      </Section>
+
       <Section title="Diagnóstico">
         <Text style={styles.text}>Status por marketplace com listas ocultas por padrão.</Text>
         <Pressable
@@ -4612,11 +6196,29 @@ function MarketplacesScreen({
                     </Pressable>
                     <Pressable
                       style={[styles.smallButton, isBusy && styles.buttonDisabled]}
-                      onPress={() => onSyncOrders(account.id)}
+                      onPress={() => onSyncOrders(account.id, "light")}
                       disabled={isBusy}
                     >
                       <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
-                        Sync vendas
+                        Vendas 48h
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.smallButton, isBusy && styles.buttonDisabled]}
+                      onPress={() => onSyncOrders(account.id, "normal")}
+                      disabled={isBusy}
+                    >
+                      <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                        Vendas 60d
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.smallButton, isBusy && styles.buttonDisabled]}
+                      onPress={() => onSyncOrders(account.id, "full")}
+                      disabled={isBusy}
+                    >
+                      <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                        Vendas 1 ano
                       </Text>
                     </Pressable>
                     <Pressable
@@ -4718,16 +6320,94 @@ function MarketplacesScreen({
                         orderItems
                           .filter((order) => order.account_id === account.id)
                           .map((order) => (
-                            <View key={order.id} style={styles.card}>
-                              <Text style={styles.cardTitle}>
-                                Pedido {maskSensitiveText(order.marketplace_order_id, isPrivacyMode, PRIVACY_MASK)}
-                              </Text>
-                              <Text style={styles.text}>Status: {order.status || "-"} {order.substatus ? `(${order.substatus})` : ""}</Text>
-                              <Text style={styles.text}>
-                                Comprador: {maskSensitiveText(order.buyer_nickname || order.buyer_id || "-", isPrivacyMode, PRIVACY_MASK)}
+	                            <View key={order.id} style={styles.card}>
+	                              <Text style={styles.cardTitle}>
+	                                Pedido {maskSensitiveText(order.marketplace_order_id, isPrivacyMode, PRIVACY_MASK)}
+	                              </Text>
+	                              <Text style={styles.text}>Status: {order.status || "-"} {order.substatus ? `(${order.substatus})` : ""}</Text>
+	                              <Text style={styles.text}>
+	                                Logística: {order.shipping_logistic_type || "-"} | Modo: {order.shipping_mode || "-"} | Tipo: {order.shipping_type || "-"}
+	                              </Text>
+	                              <Text style={styles.text}>
+	                                Envio: {order.shipping_status || "-"} {order.shipping_substatus ? `(${order.shipping_substatus})` : ""} | Etapa: {order.shipping_stage || "-"}
+	                              </Text>
+	                              <Text style={styles.text}>
+	                                Comprador: {maskSensitiveText(order.buyer_nickname || order.buyer_id || "-", isPrivacyMode, PRIVACY_MASK)}
                               </Text>
                               <Text style={styles.text}>Valor faturado (NF): {order.billed_total_cents !== null ? money(order.billed_total_cents) : order.order_total_cents !== null ? money(order.order_total_cents) : "-"}</Text>
                               <Text style={styles.text}>Valor líquido recebido (ML): {order.net_received_cents !== null ? money(order.net_received_cents) : "Aguardando consolidação financeira"}</Text>
+                              <Text style={styles.text}>
+                                Custo de produção salvo: {order.metrics ? money(order.metrics.productionCostCents) : "-"}
+                              </Text>
+                              <Text style={styles.text}>
+                                Lucro bruto estimado: {order.metrics ? money(order.metrics.grossProfitCents) : "-"}
+                              </Text>
+                              <Text style={styles.text}>
+                                Lucro líquido estimado:{" "}
+                                {order.metrics?.netProfitCents !== null && order.metrics?.netProfitCents !== undefined
+                                  ? money(order.metrics.netProfitCents)
+                                  : "Aguardando consolidação financeira"}
+                              </Text>
+                              <Text style={styles.text}>
+                                Energia {order.metrics ? money(order.metrics.energyCostCents) : "-"} | Payback{" "}
+                                {order.metrics ? money(order.metrics.paybackCostCents) : "-"} | Filamentos{" "}
+                                {order.metrics ? money(order.metrics.filamentCostCents) : "-"}
+                              </Text>
+                              <Text style={styles.text}>
+                                Snapshot: {order.snapshot_status?.label ?? "Sem status"}
+                              </Text>
+                              <Text style={styles.text}>
+                                {order.snapshot_status?.summary ?? "Sem diagnostico de snapshot."}
+                              </Text>
+                              <Text style={styles.text}>
+                                Itens com snapshot: {order.metrics?.itemsWithCostSnapshot ?? 0}/{order.metrics?.itemsCount ?? order.order_items.length}
+                              </Text>
+                              <Text style={styles.cardTitle}>Itens do pedido</Text>
+                              {order.order_items.map((item) => (
+                                <View key={item.id} style={styles.card}>
+                                  <Text style={styles.text}>
+                                    ML: {maskSensitiveText(item.title, isPrivacyMode, PRIVACY_MASK)}
+                                  </Text>
+                                  <Text style={styles.text}>
+                                    Anuncio: {maskSensitiveText(item.marketplace_item_id, isPrivacyMode, PRIVACY_MASK)} | Variacao:{" "}
+                                    {maskSensitiveText(
+                                      item.effective_marketplace_variation_id || item.effective_variation_key,
+                                      isPrivacyMode,
+                                      PRIVACY_MASK
+                                    )}
+                                  </Text>
+                                  <Text style={styles.text}>Quantidade: {item.quantity}</Text>
+                                  <Text style={styles.text}>
+                                    Vinculo atual:{" "}
+                                    {item.current_linked_sku_id
+                                      ? maskSensitiveComposite(
+                                          [item.current_linked_sku_code, item.current_linked_sku_name],
+                                          isPrivacyMode,
+                                          "SKU vinculado"
+                                        )
+                                      : "Sem SKU vinculado atualmente"}
+                                  </Text>
+                                  <Text style={styles.text}>
+                                    Variacao local:{" "}
+                                    {item.current_linked_catalog_variation_id
+                                      ? maskSensitiveText(
+                                          item.current_linked_catalog_variation_label || item.current_linked_catalog_variation_id,
+                                          isPrivacyMode,
+                                          "Variacao vinculada"
+                                        )
+                                      : "Nao encontrada no catalogo local"}
+                                  </Text>
+                                </View>
+                              ))}
+                              {order.metrics?.filamentMaterials?.length ? (
+                                <Text style={styles.text}>
+                                  Filamentos:{" "}
+                                  {order.metrics.filamentMaterials
+                                    .slice(0, 3)
+                                    .map((item) => `${item.material_type} ${money(item.total_cost_cents)}`)
+                                    .join(" | ")}
+                                </Text>
+                              ) : null}
                               <Text style={styles.text}>Atualizado em: {dateTime(order.updated_at || order.last_seen_at || "")}</Text>
                             </View>
                           ))
@@ -4824,6 +6504,172 @@ function MarketplacesScreen({
         ) : null}
       </Section>
     </ScrollView>
+  );
+}
+
+type MarketplaceListingSalesMetrics = {
+  total: number;
+  last30: number;
+  last7: number;
+  totalSource: "orders" | "orders_item" | "catalog";
+  recentSource: "orders" | "orders_item" | "unavailable";
+};
+
+function MarketplaceListingSkuConfigCard({
+  item,
+  skus,
+  localStockBySkuId,
+  salesMetrics,
+  taxRatePercent,
+  onLinkListingSku,
+  onSetListingIgnored,
+  isPrivacyMode,
+}: {
+  item: MarketplaceCatalogVariationItem;
+  skus: SalesSku[];
+  localStockBySkuId: Map<string, number>;
+  salesMetrics?: MarketplaceListingSalesMetrics;
+  taxRatePercent: number;
+  onLinkListingSku: (listingId: string, skuId: string | null) => Promise<void>;
+  onSetListingIgnored: (listingId: string, isIgnored: boolean) => Promise<void>;
+  isPrivacyMode: boolean;
+}) {
+  const [isSkuSelectOpen, setIsSkuSelectOpen] = useState(false);
+  const [skuSearch, setSkuSearch] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const selectedSku = item.linked_sku_id ? skus.find((sku) => sku.id === item.linked_sku_id) : undefined;
+  const skuFilter = skuSearch.trim().toLowerCase();
+  const filteredSkus = skus.filter((sku) => {
+    if (!skuFilter) return true;
+    return sku.skuCode.toLowerCase().includes(skuFilter) || sku.name.toLowerCase().includes(skuFilter);
+  });
+  const finalPriceCents = item.effective_price_cents ?? item.price_cents ?? 0;
+  const estimatedReceivedCents = item.estimated_net_proceeds_cents ?? 0;
+  const productionCostCents = selectedSku?.productionCostCents ?? 0;
+  const estimatedTaxCents = Math.round(finalPriceCents * (taxRatePercent / 100));
+  const contributionMarginCents = estimatedReceivedCents - productionCostCents - estimatedTaxCents;
+  const contributionMarginDecimal = finalPriceCents > 0 ? contributionMarginCents / finalPriceCents : 0;
+  const roasMin = contributionMarginDecimal > 0 ? Math.max(1, 1 / contributionMarginDecimal) : null;
+  const marketplaceStock = item.available_quantity ?? 0;
+  const localStock = selectedSku?.id ? (localStockBySkuId.get(selectedSku.id) ?? 0) : null;
+  const linkStatus =
+    !item.linked_sku_id ? "Sem SKU" : item.linked_sku_is_active === 1 ? "Vinculado" : "SKU inativo";
+  const metrics = salesMetrics ?? {
+    total: Math.max(0, Math.round(item.sold_quantity ?? 0)),
+    last30: 0,
+    last7: 0,
+    totalSource: "catalog" as const,
+    recentSource: "unavailable" as const,
+  };
+
+  const saveSkuLink = async (skuId: string | null) => {
+    try {
+      setIsSaving(true);
+      setLinkError(null);
+      await onLinkListingSku(item.id, skuId);
+      setSkuSearch("");
+      setIsSkuSelectOpen(false);
+    } catch (error: any) {
+      setLinkError(error?.message ?? "Falha ao salvar vínculo de SKU");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const ignoreListing = async () => {
+    try {
+      setIsSaving(true);
+      setLinkError(null);
+      await onSetListingIgnored(item.id, true);
+    } catch (error: any) {
+      setLinkError(error?.message ?? "Falha ao ignorar anúncio");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>{maskSensitiveText(item.title, isPrivacyMode, PRIVACY_MASK)}</Text>
+      <Text style={styles.text}>Valor do anúncio final: {money(finalPriceCents)}</Text>
+      <Text style={styles.text}>Valor recebido (estimado): {money(estimatedReceivedCents)}</Text>
+      <Text style={styles.text}>Vendas totais: {metrics.total}</Text>
+      <Text style={styles.text}>Vendas últimos 30 dias: {metrics.last30}</Text>
+      <Text style={styles.text}>Vendas últimos 7 dias: {metrics.last7}</Text>
+      {metrics.total > 0 && metrics.totalSource === "catalog" ? (
+        <Text style={styles.text}>Fonte vendas totais: catálogo sincronizado</Text>
+      ) : null}
+      {metrics.total > 0 && metrics.recentSource === "unavailable" ? (
+        <Text style={styles.text}>Vendas recentes por variação indisponíveis nos pedidos sincronizados</Text>
+      ) : null}
+      <Text style={styles.text}>
+        SKU linkado: {selectedSku ? maskNameKeepCode(selectedSku.skuCode, selectedSku.name, isPrivacyMode) : "Não selecionado"}
+      </Text>
+      <Text style={styles.text}>Status vínculo SKU: {linkStatus}</Text>
+      <Text style={styles.text}>Estoque marketplace: {marketplaceStock}</Text>
+      <Text style={styles.text}>Estoque local: {localStock !== null ? localStock : "-"}</Text>
+      <Text style={styles.text}>Custo do produto (SKU local): {selectedSku ? money(selectedSku.productionCostCents) : "-"}</Text>
+      <Text style={styles.text}>Fonte SKU: estoque local</Text>
+
+      <View style={styles.row}>
+        <View style={styles.marketplaceSkuPickerField}>
+          <Text style={styles.fieldLabel}>Selecionar SKU (digite para pesquisar)</Text>
+          <TextInput
+            style={styles.input}
+            value={skuSearch}
+            onFocus={() => setIsSkuSelectOpen(true)}
+            onBlur={() => {
+              setTimeout(() => setIsSkuSelectOpen(false), 120);
+            }}
+            onChangeText={(value) => {
+              setSkuSearch(value);
+              setIsSkuSelectOpen(true);
+            }}
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder={
+              selectedSku
+                ? maskNameKeepCode(selectedSku.skuCode, selectedSku.name, isPrivacyMode)
+                : "Digite código ou nome do SKU"
+            }
+          />
+          {isSkuSelectOpen ? (
+            <View style={styles.selectMenu}>
+              {skus.length === 0 ? (
+                <Text style={styles.text}>Nenhum SKU cadastrado.</Text>
+              ) : filteredSkus.length === 0 ? (
+                <Text style={styles.text}>Nenhum SKU encontrado para "{skuSearch}".</Text>
+              ) : (
+                filteredSkus.map((sku) => (
+                  <Pressable key={sku.id} style={styles.selectItem} onPress={() => void saveSkuLink(sku.id)}>
+                    <Text style={styles.text}>{maskNameKeepCode(sku.skuCode, sku.name, isPrivacyMode)}</Text>
+                  </Pressable>
+                ))
+              )}
+            </View>
+          ) : null}
+        </View>
+        <AppButton label="Ignorar anúncio" variant="danger" onPress={() => void ignoreListing()} disabled={isSaving} />
+        <AppButton
+          label="Remover vínculo SKU"
+          variant="secondary"
+          style={styles.marketplaceSkuRemoveButton}
+          onPress={() => void saveSkuLink(null)}
+          disabled={isSaving}
+        />
+        {isSaving ? <Text style={styles.text}>Salvando...</Text> : null}
+      </View>
+      {linkError ? <Text style={styles.errorText}>{linkError}</Text> : null}
+
+      <Text style={styles.text}>Cálculo margem estimada:</Text>
+      <Text style={styles.text}>
+        {money(estimatedReceivedCents)} - {money(productionCostCents)} - {money(estimatedTaxCents)} = {money(contributionMarginCents)}
+      </Text>
+      <Text style={styles.text}>Imposto estimado ({taxRatePercent.toFixed(2)}%): {money(estimatedTaxCents)}</Text>
+      <Text style={styles.text}>Margem decimal estimada: {contributionMarginDecimal.toFixed(4)}</Text>
+      <Text style={styles.text}>ROAS mínimo: {roasMin && Number.isFinite(roasMin) ? roasMin.toFixed(4) : "-"}</Text>
+    </View>
   );
 }
 
@@ -5004,6 +6850,14 @@ function MarketplaceListingsScreen({
     return localSkus.find((sku) => sku.id === item.linked_sku_id);
   };
 
+  const openSkuSelect = (listingId: string) => {
+    setOpenSkuSelectByListingId({ [listingId]: true });
+  };
+
+  const closeSkuSelect = (listingId: string) => {
+    setOpenSkuSelectByListingId((prev) => ({ ...prev, [listingId]: false }));
+  };
+
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <Text style={styles.pageTitle}>Marketplaces {'>'} Anúncios</Text>
@@ -5084,189 +6938,19 @@ function MarketplaceListingsScreen({
                 <Text style={styles.text}>Itens: {filteredItems.length}</Text>
               </View>
 
-              {!groupCollapsed && visibleItems.map((item) => {
-                const selectedSku = resolveLinkedSku(item);
-                const searchValue = skuSearchByListingId[item.id] ?? "";
-                const skuFilter = searchValue.trim().toLowerCase();
-                const filteredSkus = localSkus.filter((sku) => {
-                  if (!skuFilter) return true;
-                  return (
-                    sku.skuCode.toLowerCase().includes(skuFilter) ||
-                    sku.name.toLowerCase().includes(skuFilter)
-                  );
-                });
-                const salesMetrics = salesMetricsByListingId.get(item.id) ?? {
-                  total: 0,
-                  last30: 0,
-                  last7: 0,
-                  totalSource: "orders" as const,
-                  recentSource: "orders" as const,
-                };
-                const finalPriceCents = item.effective_price_cents ?? item.price_cents ?? 0;
-                const estimatedReceivedCents = item.estimated_net_proceeds_cents ?? 0;
-                const productionCostCents = selectedSku?.productionCostCents ?? 0;
-                const estimatedTaxCents = Math.round(finalPriceCents * (taxRatePercent / 100));
-                const contributionMarginCents =
-                  estimatedReceivedCents - productionCostCents - estimatedTaxCents;
-                const contributionMarginDecimal =
-                  finalPriceCents > 0 ? contributionMarginCents / finalPriceCents : 0;
-                const roasMin = contributionMarginDecimal > 0 ? Math.max(1, 1 / contributionMarginDecimal) : null;
-                const marketplaceStock = item.available_quantity ?? 0;
-                const localStock =
-                  selectedSku?.id ? (localStockBySkuId.get(selectedSku.id) ?? 0) : null;
-                const linkStatus =
-                  !item.linked_sku_id
-                    ? "Sem SKU"
-                    : item.linked_sku_is_active === 1
-                      ? "Vinculado"
-                      : "SKU inativo";
-
-                return (
-                  <View key={item.id} style={styles.card}>
-                    <Text style={styles.cardTitle}>
-                      {maskSensitiveText(item.title, isPrivacyMode, PRIVACY_MASK)}
-                    </Text>
-                    <Text style={styles.text}>Valor do anúncio final: {money(finalPriceCents)}</Text>
-                    <Text style={styles.text}>Valor recebido (estimado): {money(estimatedReceivedCents)}</Text>
-                    <Text style={styles.text}>Vendas totais: {salesMetrics.total}</Text>
-                    <Text style={styles.text}>Vendas últimos 30 dias: {salesMetrics.last30}</Text>
-                    <Text style={styles.text}>Vendas últimos 7 dias: {salesMetrics.last7}</Text>
-                    {salesMetrics.total > 0 && salesMetrics.totalSource === "catalog" ? (
-                      <Text style={styles.text}>Fonte vendas totais: catálogo sincronizado</Text>
-                    ) : null}
-                    {salesMetrics.total > 0 && salesMetrics.recentSource === "unavailable" ? (
-                      <Text style={styles.text}>Vendas recentes por variação indisponíveis nos pedidos sincronizados</Text>
-                    ) : null}
-                    <Text style={styles.text}>
-                      SKU linkado: {selectedSku ? maskNameKeepCode(selectedSku.skuCode, selectedSku.name, isPrivacyMode) : "Não selecionado"}
-                    </Text>
-                    <Text style={styles.text}>Status vínculo SKU: {linkStatus}</Text>
-                    <Text style={styles.text}>
-                      Estoque marketplace: {marketplaceStock}
-                    </Text>
-                    <Text style={styles.text}>
-                      Estoque local: {localStock !== null ? localStock : "-"}
-                    </Text>
-                    <Text style={styles.text}>
-                      Custo do produto (SKU local): {selectedSku ? money(selectedSku.productionCostCents) : "-"}
-                    </Text>
-                    <Text style={styles.text}>Fonte SKU: estoque local</Text>
-
-                    <View style={styles.row}>
-                      <View style={styles.marketplaceSkuPickerField}>
-                        <Text style={styles.fieldLabel}>Selecionar SKU (digite para pesquisar)</Text>
-                        <TextInput
-                          style={styles.input}
-                          value={searchValue}
-                          onFocus={() =>
-                            setOpenSkuSelectByListingId((prev) => ({ ...prev, [item.id]: true }))
-                          }
-                          onChangeText={(value) => {
-                            setSkuSearchByListingId((prev) => ({ ...prev, [item.id]: value }));
-                            setOpenSkuSelectByListingId((prev) => ({ ...prev, [item.id]: true }));
-                          }}
-                          autoCapitalize="none"
-                          autoCorrect={false}
-                          placeholder={
-                            selectedSku
-                              ? maskNameKeepCode(selectedSku.skuCode, selectedSku.name, isPrivacyMode)
-                              : "Digite código ou nome do SKU"
-                          }
-                        />
-                        {openSkuSelectByListingId[item.id] ? (
-                          <View style={styles.selectMenu}>
-                            {localSkus.length === 0 ? (
-                              <Text style={styles.text}>Nenhum SKU cadastrado.</Text>
-                            ) : filteredSkus.length === 0 ? (
-                              <Text style={styles.text}>Nenhum SKU encontrado para "{searchValue}".</Text>
-                            ) : (
-                              filteredSkus.map((sku) => (
-                                <Pressable
-                                  key={sku.id}
-                                  style={styles.selectItem}
-                                  onPress={() => void (async () => {
-                                    try {
-                                      setIsSavingByListingId((prev) => ({ ...prev, [item.id]: true }));
-                                      setLinkErrorByListingId((prev) => ({ ...prev, [item.id]: null }));
-                                      await onLinkListingSku(item.id, sku.id);
-                                      setSkuSearchByListingId((prev) => ({ ...prev, [item.id]: "" }));
-                                      setOpenSkuSelectByListingId((prev) => ({ ...prev, [item.id]: false }));
-                                    } catch (error: any) {
-                                      setLinkErrorByListingId((prev) => ({
-                                        ...prev,
-                                        [item.id]: error?.message ?? "Falha ao salvar vínculo de SKU",
-                                      }));
-                                    } finally {
-                                      setIsSavingByListingId((prev) => ({ ...prev, [item.id]: false }));
-                                    }
-                                  })()}
-                                >
-                                  <Text style={styles.text}>{maskNameKeepCode(sku.skuCode, sku.name, isPrivacyMode)}</Text>
-                                </Pressable>
-                              ))
-                            )}
-                          </View>
-                        ) : null}
-                      </View>
-                      <Pressable
-                        style={[styles.dangerButton, isSavingByListingId[item.id] && styles.buttonDisabled]}
-                        disabled={Boolean(isSavingByListingId[item.id])}
-                        onPress={() => void (async () => {
-                          try {
-                            setIsSavingByListingId((prev) => ({ ...prev, [item.id]: true }));
-                            setLinkErrorByListingId((prev) => ({ ...prev, [item.id]: null }));
-                            await onSetListingIgnored(item.id, true);
-                          } catch (error: any) {
-                            setLinkErrorByListingId((prev) => ({
-                              ...prev,
-                              [item.id]: error?.message ?? "Falha ao ignorar anúncio",
-                            }));
-                          } finally {
-                            setIsSavingByListingId((prev) => ({ ...prev, [item.id]: false }));
-                          }
-                        })}
-                      >
-                        <Text style={styles.dangerButtonText}>Ignorar anúncio</Text>
-                      </Pressable>
-                      <Pressable
-                        style={[styles.secondaryButton, styles.marketplaceSkuRemoveButton, isSavingByListingId[item.id] && styles.buttonDisabled]}
-                        disabled={Boolean(isSavingByListingId[item.id])}
-                        onPress={() => void (async () => {
-                          try {
-                            setIsSavingByListingId((prev) => ({ ...prev, [item.id]: true }));
-                            setLinkErrorByListingId((prev) => ({ ...prev, [item.id]: null }));
-                            await onLinkListingSku(item.id, null);
-                            setSkuSearchByListingId((prev) => ({ ...prev, [item.id]: "" }));
-                          } catch (error: any) {
-                            setLinkErrorByListingId((prev) => ({
-                              ...prev,
-                              [item.id]: error?.message ?? "Falha ao remover vínculo de SKU",
-                            }));
-                          } finally {
-                            setIsSavingByListingId((prev) => ({ ...prev, [item.id]: false }));
-                          }
-                        })}
-                      >
-                        <Text style={styles.secondaryButtonText}>Remover vínculo SKU</Text>
-                      </Pressable>
-                      {isSavingByListingId[item.id] ? <Text style={styles.text}>Salvando...</Text> : null}
-                    </View>
-                    {linkErrorByListingId[item.id] ? (
-                      <Text style={styles.errorText}>{linkErrorByListingId[item.id]}</Text>
-                    ) : null}
-
-                    <Text style={styles.text}>Cálculo margem estimada:</Text>
-                    <Text style={styles.text}>
-                      {money(estimatedReceivedCents)} - {money(productionCostCents)} - {money(estimatedTaxCents)} = {money(contributionMarginCents)}
-                    </Text>
-                    <Text style={styles.text}>Imposto estimado ({taxRatePercent.toFixed(2)}%): {money(estimatedTaxCents)}</Text>
-                    <Text style={styles.text}>Margem decimal estimada: {contributionMarginDecimal.toFixed(4)}</Text>
-                    <Text style={styles.text}>
-                      ROAS mínimo: {roasMin && Number.isFinite(roasMin) ? roasMin.toFixed(4) : "-"}
-                    </Text>
-                  </View>
-                );
-              })}
+              {!groupCollapsed && visibleItems.map((item) => (
+                <MarketplaceListingSkuConfigCard
+                  key={item.id}
+                  item={item}
+                  skus={localSkus}
+                  localStockBySkuId={localStockBySkuId}
+                  salesMetrics={salesMetricsByListingId.get(item.id)}
+                  taxRatePercent={taxRatePercent}
+                  onLinkListingSku={onLinkListingSku}
+                  onSetListingIgnored={onSetListingIgnored}
+                  isPrivacyMode={isPrivacyMode}
+                />
+              ))}
 
               {!groupCollapsed && hasMore ? (
                 <Pressable
@@ -5284,6 +6968,59 @@ function MarketplaceListingsScreen({
             </View>
           );
         })
+      )}
+    </ScrollView>
+  );
+}
+
+function MarketplaceListingConfigScreen({
+  listing,
+  skus,
+  salesStock,
+  taxRatePercent,
+  onLinkListingSku,
+  onSetListingIgnored,
+  onBack,
+  isPrivacyMode,
+}: {
+  listing?: MarketplaceCatalogVariationItem;
+  skus: SalesSku[];
+  salesStock: SalesStockOverview[];
+  taxRatePercent: number;
+  onLinkListingSku: (listingId: string, skuId: string | null) => Promise<void>;
+  onSetListingIgnored: (listingId: string, isIgnored: boolean) => Promise<void>;
+  onBack: () => void;
+  isPrivacyMode: boolean;
+}) {
+  const localStockBySkuId = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const row of salesStock) {
+      map.set(row.skuId, row.availableQuantity ?? 0);
+    }
+    return map;
+  }, [salesStock]);
+
+  return (
+    <ScrollView contentContainerStyle={styles.content}>
+      <Text style={styles.pageTitle}>Marketplaces {'>'} Configuração do Anúncio</Text>
+      <Text style={styles.pageSubtitle}>Vínculo de SKU local e leitura operacional do anúncio</Text>
+      <AppButton label="Voltar aos pedidos" variant="secondary" onPress={onBack} />
+      {!listing ? (
+        <View style={styles.errorBannerInline}>
+          <Text style={styles.errorText}>
+            Anúncio não encontrado no catálogo sincronizado. Sincronize os anúncios do Mercado Livre e tente novamente.
+          </Text>
+        </View>
+      ) : (
+        <MarketplaceListingSkuConfigCard
+          item={listing}
+          skus={skus}
+          localStockBySkuId={localStockBySkuId}
+          taxRatePercent={taxRatePercent}
+          onLinkListingSku={onLinkListingSku}
+          onSetListingIgnored={onSetListingIgnored}
+          isPrivacyMode={isPrivacyMode}
+        />
       )}
     </ScrollView>
   );
@@ -5344,11 +7081,16 @@ export default function MockupApp() {
   const [salesPointsOverview, setSalesPointsOverview] = useState<SalesPointOverview[]>([]);
   const [logs, setLogs] = useState<OperationLogItem[]>([]);
   const [marketplaceStatus, setMarketplaceStatus] = useState<MarketplaceStatusResponse | null>(null);
+  const [shopeeStatus, setShopeeStatus] = useState<MarketplaceStatusResponse | null>(null);
   const [marketplaceCatalogVariationItems, setMarketplaceCatalogVariationItems] = useState<MarketplaceCatalogVariationItem[]>([]);
   const [marketplaceOrderItems, setMarketplaceOrderItems] = useState<MarketplaceOrderItem[]>([]);
+  const [marketplaceOrdersDashboard, setMarketplaceOrdersDashboard] = useState<MarketplaceOrdersDashboardResponse | null>(null);
+  const [marketplaceNormalizationRules, setMarketplaceNormalizationRules] = useState<MarketplaceNormalizationRule[]>([]);
+  const [selectedMarketplaceListingId, setSelectedMarketplaceListingId] = useState<string | null>(null);
   const [activeCostSettingId, setActiveCostSettingId] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isMarketplaceBusy, setIsMarketplaceBusy] = useState(false);
+  const [cancelingMarketplaceRunIds, setCancelingMarketplaceRunIds] = useState<Record<string, boolean>>({});
   const [marketplaceInfo, setMarketplaceInfo] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
 
@@ -5399,6 +7141,10 @@ export default function MockupApp() {
     () => salesSkus.find((item) => item.id === editingSalesSkuId),
     [salesSkus, editingSalesSkuId]
   );
+  const currentMarketplaceListing = useMemo(
+    () => marketplaceCatalogVariationItems.find((item) => item.id === selectedMarketplaceListingId),
+    [marketplaceCatalogVariationItems, selectedMarketplaceListingId]
+  );
   const currentSalesPoint = useMemo(
     () => salesPoints.find((item) => item.id === editingSalesPointId),
     [salesPoints, editingSalesPointId]
@@ -5422,9 +7168,11 @@ export default function MockupApp() {
       salesPointForm: currentSalesPoint ? "Editar Ponto" : "Cadastro de Ponto",
       salesConsignment: "Consignação",
       salesPointsOverview: "Visão de Pontos",
-      marketplaces: "Marketplaces > Configurações",
-      marketplaceListings: "Marketplaces > Anúncios",
-      logs: "Logs",
+	      marketplaces: "Marketplaces > Configurações",
+	      marketplaceOrdersDashboard: "Marketplaces > Dashboard de Pedidos",
+	      marketplaceListings: "Marketplaces > Anúncios",
+	      marketplaceListingConfig: "Marketplaces > Configuração do Anúncio",
+	      logs: "Logs",
     };
     return map[screen];
   }, [screen, currentPrinter, currentFilament, currentQuote, currentSalesSku, currentSalesPoint]);
@@ -5528,6 +7276,12 @@ export default function MockupApp() {
     return status;
   };
 
+  const fetchShopeeStatus = async () => {
+    const status = await apiFetch<MarketplaceStatusResponse>("/integrations/shopee/status");
+    setShopeeStatus(status);
+    return status;
+  };
+
   const fetchMarketplaceCatalogVariations = async () => {
     const items = await apiFetch<MarketplaceCatalogVariationItem[]>(
       "/integrations/mercadolivre/catalog/variations?limit=100"
@@ -5538,9 +7292,25 @@ export default function MockupApp() {
   };
 
   const fetchMarketplaceOrders = async () => {
-    const items = await apiFetch<MarketplaceOrderItem[]>("/integrations/mercadolivre/orders?limit=50");
+    const items = await apiFetch<MarketplaceOrderItem[]>("/integrations/mercadolivre/orders?limit=5000");
     setMarketplaceOrderItems(items);
     return items;
+  };
+
+  const fetchMarketplaceOrdersDashboard = async () => {
+    const dashboard = await apiFetch<MarketplaceOrdersDashboardResponse>(
+      "/integrations/mercadolivre/orders/dashboard"
+    );
+    setMarketplaceOrdersDashboard(dashboard);
+    return dashboard;
+  };
+
+  const fetchMarketplaceNormalizationRules = async () => {
+    const rules = await apiFetch<MarketplaceNormalizationRule[]>(
+      "/integrations/marketplaces/normalization-rules?marketplace=mercadolivre&category=shipping_logistic_type"
+    );
+    setMarketplaceNormalizationRules(rules);
+    return rules;
   };
 
   const fetchActiveCostSettings = async () => {
@@ -5570,8 +7340,11 @@ export default function MockupApp() {
           fetchConsignmentBatches(),
           fetchSalesPointsOverview(),
           fetchMarketplaceStatus(),
+          fetchShopeeStatus(),
           fetchMarketplaceCatalogVariations(),
           fetchMarketplaceOrders(),
+          fetchMarketplaceOrdersDashboard(),
+          fetchMarketplaceNormalizationRules(),
           fetchLogs(),
         ]);
       } catch (error: any) {
@@ -5591,11 +7364,14 @@ export default function MockupApp() {
   }, [screen]);
 
   useEffect(() => {
-    if (screen !== "marketplaces") return;
+	    if (!["marketplaces", "marketplaceOrdersDashboard", "marketplaceListingConfig"].includes(screen)) return;
     void Promise.all([
       fetchMarketplaceStatus(),
+      fetchShopeeStatus(),
       fetchMarketplaceCatalogVariations(),
       fetchMarketplaceOrders(),
+      fetchMarketplaceOrdersDashboard(),
+      fetchMarketplaceNormalizationRules(),
     ]).catch((error: any) => {
       setSyncError(error?.message ?? "Falha ao carregar status dos marketplaces");
     });
@@ -5665,13 +7441,80 @@ export default function MockupApp() {
     })();
   };
 
+  const handleStartShopeeAuth = () => {
+    void (async () => {
+      try {
+        setIsMarketplaceBusy(true);
+        setSyncError(null);
+        setMarketplaceInfo(null);
+        const payload = await apiFetch<{ authorize_url: string }>("/integrations/shopee/connect", {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+
+        if (!payload?.authorize_url) {
+          throw new Error("URL de autorização Shopee não retornada pelo backend.");
+        }
+
+        const webWindow = typeof globalThis !== "undefined" ? (globalThis as any).window : undefined;
+        if (Platform.OS === "web" && webWindow?.open) {
+          webWindow.open(payload.authorize_url, "_blank", "noopener,noreferrer");
+        } else {
+          await Linking.openURL(payload.authorize_url);
+        }
+
+        setMarketplaceInfo("Autorização Shopee iniciada. Após concluir na Shopee, clique em Atualizar status.");
+      } catch (error: any) {
+        setSyncError(error?.message ?? "Falha ao iniciar autorização da Shopee");
+      } finally {
+        setIsMarketplaceBusy(false);
+      }
+    })();
+  };
+
+  const handleRefreshShopeeStatus = () => {
+    void (async () => {
+      try {
+        setIsMarketplaceBusy(true);
+        setSyncError(null);
+        await fetchShopeeStatus();
+      } catch (error: any) {
+        setSyncError(error?.message ?? "Falha ao atualizar status da Shopee");
+      } finally {
+        setIsMarketplaceBusy(false);
+      }
+    })();
+  };
+
+  const handleDisconnectShopee = () => {
+    void (async () => {
+      try {
+        setIsMarketplaceBusy(true);
+        setSyncError(null);
+        await apiFetch("/integrations/shopee/disconnect", {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        await Promise.all([fetchShopeeStatus(), fetchLogs()]);
+        setMarketplaceInfo("Todas as contas da Shopee foram desconectadas.");
+      } catch (error: any) {
+        setSyncError(error?.message ?? "Falha ao desconectar Shopee");
+      } finally {
+        setIsMarketplaceBusy(false);
+      }
+    })();
+  };
+
   const handleSyncMarketplaceCatalog = (accountId?: string) => {
     void (async () => {
       try {
         setIsMarketplaceBusy(true);
         setSyncError(null);
         setMarketplaceInfo(null);
-        const result = await apiFetch<{
+        const syncRequest = apiFetch<{
+          ok?: boolean;
+          cancelled?: boolean;
+          message?: string;
           records_read: number;
           records_upserted: number;
           records_failed: number;
@@ -5679,13 +7522,18 @@ export default function MockupApp() {
           method: "POST",
           body: JSON.stringify({ limit: 200, account_id: accountId ?? "" }),
         });
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await fetchLogs().catch(() => undefined);
+        const result = await syncRequest;
         await Promise.all([
           fetchMarketplaceStatus(),
           fetchMarketplaceCatalogVariations(),
           fetchLogs(),
         ]);
         setMarketplaceInfo(
-          `Sync concluído. Lidos: ${result.records_read}, atualizados: ${result.records_upserted}, falhas: ${result.records_failed}.`
+          result.cancelled
+            ? `Sync interrompido. Alterações revertidas. Lidos antes da interrupção: ${result.records_read}.`
+            : `Sync concluído. Lidos: ${result.records_read}, atualizados: ${result.records_upserted}, falhas: ${result.records_failed}.`
         );
       } catch (error: any) {
         setSyncError(error?.message ?? "Falha ao sincronizar catálogo Mercado Livre");
@@ -5695,23 +7543,38 @@ export default function MockupApp() {
     })();
   };
 
-  const handleSyncMarketplaceOrders = (accountId?: string) => {
+  const handleSyncMarketplaceOrders = (accountId: string | undefined, mode: MarketplaceOrdersSyncMode = "normal") => {
     void (async () => {
       try {
+        const modeLabel =
+          mode === "light" ? "últimas 48h" : mode === "normal" ? "últimos 60 dias" : "último ano";
         setIsMarketplaceBusy(true);
         setSyncError(null);
         setMarketplaceInfo(null);
-        const result = await apiFetch<{
+        const syncRequest = apiFetch<{
+          ok?: boolean;
+          cancelled?: boolean;
+          message?: string;
           records_read: number;
           records_upserted: number;
           records_failed: number;
         }>("/integrations/mercadolivre/sync/orders", {
           method: "POST",
-          body: JSON.stringify({ limit: 200, account_id: accountId ?? "" }),
+          body: JSON.stringify({ mode, account_id: accountId ?? "" }),
         });
-        await Promise.all([fetchMarketplaceStatus(), fetchMarketplaceOrders(), fetchLogs()]);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await fetchLogs().catch(() => undefined);
+        const result = await syncRequest;
+        await Promise.all([
+          fetchMarketplaceStatus(),
+          fetchMarketplaceOrders(),
+          fetchMarketplaceOrdersDashboard(),
+          fetchLogs(),
+        ]);
         setMarketplaceInfo(
-          `Sync de pedidos concluído. Lidos: ${result.records_read}, atualizados: ${result.records_upserted}, falhas: ${result.records_failed}.`
+          result.cancelled
+            ? `Sync de pedidos (${modeLabel}) interrompido. Alterações revertidas. Lidos antes da interrupção: ${result.records_read}.`
+            : `Sync de pedidos (${modeLabel}) concluído. Lidos: ${result.records_read}, atualizados: ${result.records_upserted}, falhas: ${result.records_failed}.`
         );
       } catch (error: any) {
         setSyncError(error?.message ?? "Falha ao sincronizar pedidos Mercado Livre");
@@ -5720,6 +7583,98 @@ export default function MockupApp() {
       }
     })();
   };
+
+  const handleCancelMarketplaceSync = (runId: string) => {
+    void (async () => {
+      try {
+        setCancelingMarketplaceRunIds((prev) => ({ ...prev, [runId]: true }));
+        setSyncError(null);
+        await apiFetch(`/integrations/mercadolivre/sync/${encodeURIComponent(runId)}/cancel`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        await fetchLogs();
+        setMarketplaceInfo("Interrupção solicitada. O backend vai reverter a transação no próximo ponto de parada.");
+      } catch (error: any) {
+        setSyncError(error?.message ?? "Falha ao solicitar interrupção da sincronização");
+      } finally {
+        setCancelingMarketplaceRunIds((prev) => ({ ...prev, [runId]: false }));
+      }
+    })();
+  };
+
+  const handleRecalculateAllMarketplaceOrderSnapshots = () => {
+    void (async () => {
+      try {
+        setIsMarketplaceBusy(true);
+        setSyncError(null);
+        setMarketplaceInfo(null);
+        const result = await apiFetch<{
+          orders_processed: number;
+          items_processed: number;
+          items_updated: number;
+          items_skipped: number;
+        }>("/integrations/mercadolivre/orders/recalculate-snapshots", {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        await Promise.all([fetchMarketplaceOrders(), fetchMarketplaceOrdersDashboard(), fetchLogs()]);
+        setMarketplaceInfo(
+          `Recalculo global concluído. Pedidos: ${result.orders_processed}, itens atualizados: ${result.items_updated}, ignorados: ${result.items_skipped}.`
+        );
+      } catch (error: any) {
+        setSyncError(error?.message ?? "Falha ao recalcular snapshots de custo");
+      } finally {
+        setIsMarketplaceBusy(false);
+      }
+    })();
+  };
+
+	  const handleRecalculateSingleMarketplaceOrderSnapshot = (orderId: string) => {
+	    void (async () => {
+      try {
+        setIsMarketplaceBusy(true);
+        setSyncError(null);
+        setMarketplaceInfo(null);
+        const result = await apiFetch<{
+          marketplace_order_id: string;
+          orders_processed: number;
+          items_processed: number;
+          items_updated: number;
+          items_skipped: number;
+        }>(`/integrations/mercadolivre/orders/${orderId}/recalculate-snapshots`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        await Promise.all([fetchMarketplaceOrders(), fetchMarketplaceOrdersDashboard(), fetchLogs()]);
+        setMarketplaceInfo(
+          `Pedido ${result.marketplace_order_id} recalculado. Itens atualizados: ${result.items_updated}, ignorados: ${result.items_skipped}.`
+        );
+      } catch (error: any) {
+        setSyncError(error?.message ?? "Falha ao recalcular snapshot do pedido");
+      } finally {
+        setIsMarketplaceBusy(false);
+      }
+	    })();
+	  };
+
+	  const handleOpenMarketplaceListingSkuConfig = (target: MarketplaceOrderSkuLinkTarget) => {
+	    const listing =
+	      (target.catalogVariationId
+	        ? marketplaceCatalogVariationItems.find((item) => item.id === target.catalogVariationId)
+	        : undefined) ??
+	      marketplaceCatalogVariationItems.find((item) => {
+	        if (item.account_id !== target.accountId) return false;
+	        if (item.marketplace_item_id !== target.marketplaceItemId) return false;
+	        if (target.marketplaceVariationId) {
+	          return item.marketplace_variation_id === target.marketplaceVariationId;
+	        }
+	        return item.variation_key === target.variationKey || item.marketplace_variation_id === null;
+	      });
+
+	    setSelectedMarketplaceListingId(listing?.id ?? null);
+	    setScreen("marketplaceListingConfig");
+	  };
 
   const handleRunMarketplaceCustomRequest = async (params: {
     accountId: string;
@@ -5738,6 +7693,25 @@ export default function MockupApp() {
         body: params.body,
       }),
     });
+  };
+
+  const handleSaveMarketplaceNormalizationRules = async (
+    rules: Array<{ raw_value: string; normalized_label: string; is_active: boolean }>
+  ) => {
+    const payload = await apiFetch<{ rules: MarketplaceNormalizationRule[] }>(
+      "/integrations/marketplaces/normalization-rules",
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          marketplace: "mercadolivre",
+          category: "shipping_logistic_type",
+          rules,
+        }),
+      }
+    );
+    setMarketplaceNormalizationRules(payload.rules ?? []);
+    await fetchLogs().catch(() => undefined);
+    setMarketplaceInfo("Normalização de nomes salva.");
   };
 
   const handleLinkMarketplaceListingSku = async (listingId: string, skuId: string | null) => {
@@ -5924,17 +7898,18 @@ export default function MockupApp() {
           <NavButton label="Custos" active={screen === "fixedCosts"} onPress={() => setScreen("fixedCosts")} responsiveWidth />
           <NavDropdown
             label="Marketplaces"
-            active={["marketplaces", "marketplaceListings"].includes(screen)}
+	            active={["marketplaces", "marketplaceOrdersDashboard", "marketplaceListings", "marketplaceListingConfig"].includes(screen)}
             isOpen={openNavDropdown === "marketplaces"}
             onToggle={() => setOpenNavDropdown((prev) => (prev === "marketplaces" ? null : "marketplaces"))}
             onSelectItem={(onPress) => {
               onPress();
               setOpenNavDropdown(null);
             }}
-            items={[
-              { label: "Configurações", active: screen === "marketplaces", onPress: () => setScreen("marketplaces") },
-              { label: "Anúncios", active: screen === "marketplaceListings", onPress: () => setScreen("marketplaceListings") },
-            ]}
+	            items={[
+	              { label: "Configurações", active: screen === "marketplaces", onPress: () => setScreen("marketplaces") },
+	              { label: "Dashboard pedidos", active: screen === "marketplaceOrdersDashboard", onPress: () => setScreen("marketplaceOrdersDashboard") },
+	              { label: "Anúncios", active: screen === "marketplaceListings", onPress: () => setScreen("marketplaceListings") },
+	            ]}
           />
           <NavButton label="Logs" active={screen === "logs"} onPress={() => setScreen("logs")} responsiveWidth />
         </View>
@@ -6616,22 +8591,60 @@ export default function MockupApp() {
       {screen === "marketplaces" && (
         <MarketplacesScreen
           status={marketplaceStatus}
+          shopeeStatus={shopeeStatus}
           catalogVariationItems={marketplaceCatalogVariationItems}
           orderItems={marketplaceOrderItems}
+          ordersDashboard={marketplaceOrdersDashboard}
+          normalizationRules={marketplaceNormalizationRules}
           onStartMercadoLivreAuth={handleStartMercadoLivreAuth}
-          onRefreshStatus={handleRefreshMarketplaceStatus}
-          onSyncCatalog={handleSyncMarketplaceCatalog}
-          onSyncOrders={handleSyncMarketplaceOrders}
+          onStartShopeeAuth={handleStartShopeeAuth}
+	          onRefreshStatus={handleRefreshMarketplaceStatus}
+	          onRefreshShopeeStatus={handleRefreshShopeeStatus}
+	          onSyncCatalog={handleSyncMarketplaceCatalog}
+	          onSyncOrders={handleSyncMarketplaceOrders}
           onDisconnectAll={handleDisconnectMarketplace}
+          onDisconnectShopee={handleDisconnectShopee}
           onSetListingIgnored={handleSetMarketplaceListingIgnored}
+          onSaveNormalizationRules={handleSaveMarketplaceNormalizationRules}
           onRunCustomRequest={handleRunMarketplaceCustomRequest}
-          isBusy={isMarketplaceBusy}
-          infoMessage={marketplaceInfo}
-          isPrivacyMode={isPrivacyMode}
-        />
-      )}
+	          isBusy={isMarketplaceBusy}
+	          infoMessage={marketplaceInfo}
+	          isPrivacyMode={isPrivacyMode}
+	        />
+	      )}
 
-      {screen === "marketplaceListings" && (
+	      {screen === "marketplaceOrdersDashboard" && (
+	        <ScrollView contentContainerStyle={styles.content}>
+	          <Text style={styles.pageTitle}>Marketplaces {'>'} Dashboard de Pedidos</Text>
+	          <Text style={styles.pageSubtitle}>Consulta financeira por período, logística e status</Text>
+	          <MarketplaceOrdersDashboardSection
+	            orderItems={marketplaceOrderItems}
+	            accounts={marketplaceStatus?.accounts ?? []}
+	            normalizationRules={marketplaceNormalizationRules}
+	            isBusy={isMarketplaceBusy}
+	            taxRatePercent={parseLocaleNumber(taxRate) || 0}
+		            onRecalculateAllOrderSnapshots={handleRecalculateAllMarketplaceOrderSnapshots}
+		            onRecalculateSingleOrderSnapshot={handleRecalculateSingleMarketplaceOrderSnapshot}
+		            onOpenSkuLinking={handleOpenMarketplaceListingSkuConfig}
+		            isPrivacyMode={isPrivacyMode}
+		          />
+		        </ScrollView>
+		      )}
+
+		      {screen === "marketplaceListingConfig" && (
+		        <MarketplaceListingConfigScreen
+		          listing={currentMarketplaceListing}
+		          skus={salesSkus}
+		          salesStock={salesStock}
+		          taxRatePercent={parseLocaleNumber(taxRate) || 0}
+		          onLinkListingSku={handleLinkMarketplaceListingSku}
+		          onSetListingIgnored={handleSetMarketplaceListingIgnored}
+		          onBack={() => setScreen("marketplaceOrdersDashboard")}
+		          isPrivacyMode={isPrivacyMode}
+		        />
+		      )}
+
+		      {screen === "marketplaceListings" && (
         <MarketplaceListingsScreen
           status={marketplaceStatus}
           catalogVariationItems={marketplaceCatalogVariationItems}
@@ -6645,7 +8658,13 @@ export default function MockupApp() {
         />
       )}
 
-      {screen === "logs" && <LogsScreen logs={logs} />}
+      {screen === "logs" && (
+        <LogsScreen
+          logs={logs}
+          onCancelMarketplaceSync={handleCancelMarketplaceSync}
+          cancelingRunIds={cancelingMarketplaceRunIds}
+        />
+      )}
 
       <ConfirmDialog
         visible={confirmState.visible}
@@ -7075,6 +9094,377 @@ const styles = StyleSheet.create({
   marketplaceSkuRemoveButton: {
     minWidth: 170,
   },
+  marketplaceMetricGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+  },
+  marketplaceMetricCard: {
+    flexGrow: 1,
+    flexBasis: 180,
+    minWidth: 160,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#d9e0ef",
+    borderRadius: 8,
+    padding: 12,
+    gap: 4,
+  },
+  marketplaceMetricCardActive: {
+    borderColor: "#1e3a79",
+    backgroundColor: "#f3f7ff",
+  },
+  marketplaceMetricLabel: {
+    fontSize: 12,
+    color: "#5f6f93",
+    fontWeight: "700",
+  },
+  marketplaceMetricValue: {
+    fontSize: 20,
+    color: "#1c2438",
+    fontWeight: "800",
+  },
+  marketplaceMetricDelta: {
+    alignSelf: "flex-start",
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    fontSize: 12,
+    fontWeight: "800",
+  },
+  marketplaceMetricDeltaPositive: {
+    backgroundColor: "#dcfce7",
+    color: "#166534",
+  },
+  marketplaceMetricDeltaNegative: {
+    backgroundColor: "#fee2e2",
+    color: "#991b1b",
+  },
+  marketplaceMetricPrevious: {
+    fontSize: 12,
+    color: "#6b768f",
+  },
+  marketplaceMetricChartHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "flex-start",
+    gap: 12,
+    flexWrap: "wrap",
+  },
+  marketplaceMetricChartScale: {
+    fontSize: 12,
+    color: "#5f6f93",
+    fontWeight: "700",
+  },
+  marketplaceMetricChartLegend: {
+    flexDirection: "row",
+    gap: 14,
+    flexWrap: "wrap",
+    marginTop: 4,
+  },
+  marketplaceMetricChartScrollContent: {
+    minWidth: "100%",
+    justifyContent: "center",
+  },
+  marketplaceMetricChartLayout: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "center",
+    gap: 10,
+  },
+  marketplaceMetricChartScaleAxis: {
+    width: 88,
+    marginTop: 18,
+    justifyContent: "space-between",
+    alignItems: "flex-end",
+  },
+  marketplaceMetricChartFrame: {
+    marginTop: 8,
+    paddingTop: 10,
+    paddingBottom: 4,
+    position: "relative",
+    alignItems: "center",
+  },
+  marketplaceMetricChartCanvas: {
+    position: "relative",
+    marginHorizontal: 8,
+  },
+  marketplaceMetricChartSegment: {
+    position: "absolute",
+    height: 3,
+    borderRadius: 999,
+  },
+  marketplaceMetricChartDot: {
+    position: "absolute",
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: "#ffffff",
+    zIndex: 3,
+  },
+  marketplaceMetricChartTooltip: {
+    position: "absolute",
+    width: 148,
+    zIndex: 5,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    shadowColor: "#000000",
+    shadowOpacity: 0.12,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+  },
+  marketplaceMetricChartTooltipTitle: {
+    fontSize: 11,
+    color: "#5f6f93",
+    fontWeight: "800",
+  },
+  marketplaceMetricChartTooltipText: {
+    marginTop: 2,
+    fontSize: 12,
+    color: "#1c2438",
+    fontWeight: "700",
+  },
+  marketplaceMetricChartGridLineTop: {
+    position: "absolute",
+    left: 8,
+    right: 8,
+    top: 10,
+    height: 1,
+    backgroundColor: "#e6ebf5",
+  },
+  marketplaceMetricChartGridLineMiddle: {
+    position: "absolute",
+    left: 8,
+    right: 8,
+    top: 100,
+    height: 1,
+    backgroundColor: "#eef2f8",
+  },
+  marketplaceMetricChartGridLineBottom: {
+    position: "absolute",
+    left: 8,
+    right: 8,
+    top: 190,
+    height: 1,
+    backgroundColor: "#e6ebf5",
+  },
+  marketplaceMetricChartAxis: {
+    marginHorizontal: 8,
+    marginTop: 6,
+    flexDirection: "row",
+    justifyContent: "space-between",
+  },
+  marketplaceMetricChartAxisText: {
+    fontSize: 11,
+    color: "#6b768f",
+    fontWeight: "700",
+  },
+  marketplaceChartsGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 10,
+    alignItems: "stretch",
+  },
+  marketplaceChartCard: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 360,
+    minWidth: 320,
+  },
+  marketplaceChartsToggleButton: {
+    width: 36,
+    minWidth: 36,
+    height: 32,
+    minHeight: 32,
+    paddingHorizontal: 0,
+    borderRadius: 8,
+  },
+  marketplaceChartsToggleButtonText: {
+    fontSize: 18,
+    lineHeight: 20,
+  },
+  marketplaceLogisticsChartWrap: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 16,
+    flexWrap: "wrap",
+  },
+  marketplaceLogisticsPieOuter: {
+    width: 172,
+    height: 172,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  marketplaceLogisticsPie: {
+    width: 156,
+    height: 156,
+    borderRadius: 78,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  marketplaceLogisticsPieCenter: {
+    width: 82,
+    height: 82,
+    borderRadius: 41,
+    backgroundColor: "#ffffff",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "#e6ebf5",
+  },
+  marketplaceLogisticsPieTotal: {
+    fontSize: 22,
+    fontWeight: "800",
+    color: "#1c2438",
+  },
+  marketplaceLogisticsPieLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#6b768f",
+  },
+  marketplaceLogisticsLegend: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 240,
+    gap: 8,
+  },
+  marketplaceLogisticsLegendItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  marketplaceLogisticsLegendSwatch: {
+    width: 12,
+    height: 12,
+    borderRadius: 3,
+  },
+  marketplaceFilterGroup: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 260,
+    minWidth: 220,
+    gap: 6,
+  },
+  marketplaceStockStatusGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  marketplaceStockStatusPill: {
+    flexGrow: 1,
+    flexBasis: 150,
+    minWidth: 130,
+    borderWidth: 1,
+    borderColor: "#d9e0ef",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    backgroundColor: "#f8fafc",
+  },
+  marketplaceStockStatusValue: {
+    marginTop: 2,
+    fontSize: 18,
+    fontWeight: "800",
+    color: "#1c2438",
+  },
+  marketplaceStockPendingList: {
+    gap: 8,
+  },
+  marketplaceStockPendingItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    borderWidth: 1,
+    borderColor: "#f5d08a",
+    backgroundColor: "#fffbeb",
+    borderRadius: 8,
+    padding: 10,
+    flexWrap: "wrap",
+  },
+  marketplaceStockPendingText: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 300,
+    gap: 2,
+  },
+  marketplaceCompactOrderCard: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#d9e0ef",
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 8,
+  },
+  marketplaceCompactOrderHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  marketplaceCompactOrderBuyer: {
+    flex: 1,
+    minWidth: 180,
+  },
+  marketplaceCompactOrderNumbers: {
+    alignItems: "flex-end",
+    gap: 4,
+  },
+  marketplaceOrderRevenue: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#1c2438",
+  },
+  marketplaceOrderProfitPositive: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#166534",
+  },
+  marketplaceOrderProfitNegative: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#991b1b",
+  },
+  marketplaceOrderDetails: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: "#e6ebf5",
+    gap: 4,
+  },
+  marketplaceOrderItemCompact: {
+    backgroundColor: "#f6f8fc",
+    borderRadius: 8,
+    padding: 8,
+    marginTop: 6,
+  },
+  marketplaceOrderItemMissingSku: {
+    backgroundColor: "#fff7ed",
+    borderWidth: 1,
+    borderColor: "#fdba74",
+  },
+  marketplaceMissingSkuActions: {
+    marginTop: 8,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  marketplaceMissingSkuText: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 220,
+    color: "#9a3412",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  marketplaceCalendarDayInRange: {
+    backgroundColor: "#dbeafe",
+  },
   marketplaceCheckboxRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -7174,8 +9564,49 @@ const styles = StyleSheet.create({
     gap: 8,
     flexWrap: "wrap",
   },
+  appButtonBase: {
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  appButtonTextBase: {
+    textAlign: "center",
+  },
+  appButtonPrimary: {
+    minHeight: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
+  appButtonSecondary: {
+    minHeight: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
+  appButtonSmall: {
+    height: 40,
+    minWidth: 110,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+  },
+  appButtonDanger: {
+    height: 40,
+    minWidth: 110,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+  },
+  appButtonNav: {
+    height: 36,
+    maxHeight: 36,
+    minHeight: 36,
+    paddingHorizontal: 8,
+    paddingVertical: 0,
+    borderRadius: 12,
+  },
   primaryButtonFixed: {
-    backgroundColor: "#1e3a79",
+    ...APP_BUTTON_THEME.primary.inactive,
+    borderWidth: 1,
     minHeight: 44,
     paddingHorizontal: 12,
     paddingVertical: 12,
@@ -7184,9 +9615,8 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   secondaryButton: {
-    backgroundColor: "#ffffff",
+    ...APP_BUTTON_THEME.secondary.inactive,
     borderWidth: 1,
-    borderColor: "#9cb0d8",
     minHeight: 44,
     paddingHorizontal: 12,
     paddingVertical: 12,
@@ -7195,17 +9625,14 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   primaryButtonText: {
-    color: "#f5f8ff",
-    fontSize: 13,
-    fontWeight: "700",
+    ...APP_BUTTON_THEME.primary.textInactive,
   },
   secondaryButtonText: {
-    color: "#29467f",
-    fontSize: 13,
-    fontWeight: "700",
+    ...APP_BUTTON_THEME.secondary.textInactive,
   },
   smallButton: {
-    backgroundColor: "#eef3ff",
+    ...APP_BUTTON_THEME.small.inactive,
+    borderWidth: 1,
     height: 40,
     minWidth: 110,
     paddingHorizontal: 12,
@@ -7214,15 +9641,11 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   smallButtonText: {
-    color: "#23407e",
-    fontSize: 12,
-    fontWeight: "700",
-    textAlign: "center",
+    ...APP_BUTTON_THEME.small.textInactive,
   },
   dangerButton: {
-    backgroundColor: "#ffe8e8",
+    ...APP_BUTTON_THEME.danger.inactive,
     borderWidth: 1,
-    borderColor: "#f2bcbc",
     height: 40,
     minWidth: 110,
     paddingHorizontal: 12,
@@ -7231,10 +9654,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   dangerButtonText: {
-    color: "#902222",
-    fontSize: 12,
-    fontWeight: "700",
-    textAlign: "center",
+    ...APP_BUTTON_THEME.danger.textInactive,
   },
   wideButton: {
     backgroundColor: "#eef3ff",
