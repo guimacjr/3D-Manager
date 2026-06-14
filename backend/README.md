@@ -71,6 +71,19 @@ Servidor padrao: `http://localhost:3333`
   - refaz o snapshot de custo de todos os pedidos locais (ou por conta via `account_id`)
 - `POST /integrations/mercadolivre/orders/:id/recalculate-snapshots`
   - refaz o snapshot apenas do pedido local informado
+
+## Scheduler de vendas Mercado Livre
+
+O backend agenda sincronizacoes periodicas de pedidos para todas as contas Mercado Livre ativas.
+
+Configuracao por ambiente:
+- `ML_ORDERS_SYNC_SCHEDULER_ENABLED=true`
+- `ML_ORDERS_SYNC_INCREMENTAL_INTERVAL_MINUTES=10`
+- `ML_ORDERS_SYNC_48H_INTERVAL_MINUTES=120`
+- `ML_ORDERS_SYNC_60D_INTERVAL_MINUTES=1440`
+- `ML_ORDERS_SYNC_SCHEDULER_TICK_SECONDS=60`
+
+Use `0` em um intervalo para desativar apenas aquela rotina.
 - `GET /integrations/mercadolivre/orders/dashboard`
   - consolida vendas, custos salvos, lucro bruto/liquido e ranking de materiais usados
 - `POST /integrations/mercadolivre/sync/:runId/cancel`

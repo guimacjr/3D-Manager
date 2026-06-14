@@ -62,6 +62,12 @@ type MercadoLivreMultiGetItemEntry = {
     sold_quantity?: number;
     site_id?: string;
     seller_id?: number;
+    shipping?: {
+      mode?: string;
+      logistic_type?: string;
+      free_shipping?: boolean;
+      tags?: string[];
+    };
   };
 };
 
@@ -257,6 +263,10 @@ export type MercadoLivreItemSnapshot = {
   soldQuantity?: number;
   siteId?: string;
   sellerId?: string;
+  shippingMode?: string;
+  shippingLogisticType?: string;
+  shippingFree?: boolean;
+  shippingTags?: string[];
   raw: unknown;
 };
 
@@ -679,6 +689,13 @@ export async function fetchMercadoLivreItems(params: {
         soldQuantity: typeof entry.body.sold_quantity === "number" ? Math.round(entry.body.sold_quantity) : undefined,
         siteId: entry.body.site_id,
         sellerId: typeof entry.body.seller_id === "number" ? String(entry.body.seller_id) : undefined,
+        shippingMode: entry.body.shipping?.mode,
+        shippingLogisticType: entry.body.shipping?.logistic_type,
+        shippingFree:
+          typeof entry.body.shipping?.free_shipping === "boolean" ? entry.body.shipping.free_shipping : undefined,
+        shippingTags: Array.isArray(entry.body.shipping?.tags)
+          ? entry.body.shipping.tags.filter((tag) => typeof tag === "string")
+          : undefined,
         raw: entry.body,
       });
     }

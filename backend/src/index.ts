@@ -75,6 +75,7 @@ const mediaRoot = process.env.MEDIA_ROOT ?? path.resolve(backendRoot, "storage",
 const db = createDb(dbPath);
 runMigrations(db, migrationsDir);
 const marketplaceSyncCancelRequests = new Set<string>();
+const marketplaceOrdersSyncRunningAccounts = new Set<string>();
 
 function ensureMarketplaceCatalogVariationColumns() {
   const columns = db
@@ -107,6 +108,23 @@ function ensureMarketplaceCatalogItemColumns() {
   if (!names.has("category_id")) {
     db.prepare("ALTER TABLE marketplace_catalog_items ADD COLUMN category_id TEXT").run();
   }
+  if (!names.has("shipping_mode")) {
+    db.prepare("ALTER TABLE marketplace_catalog_items ADD COLUMN shipping_mode TEXT").run();
+  }
+  if (!names.has("shipping_logistic_type")) {
+    db.prepare("ALTER TABLE marketplace_catalog_items ADD COLUMN shipping_logistic_type TEXT").run();
+  }
+  if (!names.has("shipping_free")) {
+    db.prepare("ALTER TABLE marketplace_catalog_items ADD COLUMN shipping_free INTEGER CHECK (shipping_free IN (0,1))").run();
+  }
+  if (!names.has("shipping_tags_json")) {
+    db.prepare("ALTER TABLE marketplace_catalog_items ADD COLUMN shipping_tags_json TEXT").run();
+  }
+
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_marketplace_catalog_items_shipping_logistic
+      ON marketplace_catalog_items (marketplace, shipping_logistic_type)`
+  ).run();
 }
 
 ensureMarketplaceCatalogItemColumns();
@@ -223,6 +241,7 @@ const salesSkuSchema = z.object({
   sync_with_quote_pricing: z.boolean().optional(),
   copy_from_quote: z.boolean().optional().default(false),
   copy_media_from_quote: z.boolean().optional().default(false),
+  barcodes: z.array(z.string()).optional().default([]),
   media: z
     .array(
       z.object({
@@ -327,7 +346,7 @@ const mercadoLivreCatalogVariationIgnoreSchema = z.object({
 
 const mercadoLivreOrdersSyncSchema = z.object({
   account_id: z.string().optional().or(z.literal("")),
-  mode: z.enum(["light", "normal", "full"]).optional().default("normal"),
+  mode: z.enum(["incremental", "light", "normal", "full"]).optional().default("normal"),
   limit: z.number().int().positive().max(50000).optional(),
 });
 
@@ -1678,7 +1697,10 @@ function appendMarketplaceSyncLog(params: {
   });
 }
 
-function resolveMercadoLivreOrdersSyncWindow(mode: "light" | "normal" | "full", requestedLimit?: number) {
+function resolveMercadoLivreOrdersSyncWindow(
+  mode: "incremental" | "light" | "normal" | "full",
+  requestedLimit?: number
+) {
   const now = new Date();
   const from = new Date(now);
   const defaultLimit = mode === "light" ? 500 : mode === "normal" ? 5000 : 50000;
@@ -1693,11 +1715,14 @@ function resolveMercadoLivreOrdersSyncWindow(mode: "light" | "normal" | "full", 
 
   return {
     mode,
+    stopAtFirstImported: mode === "incremental",
     dateCreatedFrom: from.toISOString(),
     dateCreatedTo: now.toISOString(),
     limit: Math.min(requestedLimit ?? defaultLimit, defaultLimit),
     label:
-      mode === "light"
+      mode === "incremental"
+        ? "últimas vendas"
+        : mode === "light"
         ? "últimas 48h"
         : mode === "normal"
           ? "últimos 60 dias"
@@ -2141,6 +2166,19 @@ function resolveMercadoLivreAccount(accountId?: string | null): MarketplaceAccou
   return (row as MarketplaceAccountRow | undefined) ?? null;
 }
 
+function listActiveMercadoLivreAccountIds(): string[] {
+  const rows = db
+    .prepare(
+      `SELECT id
+       FROM marketplace_accounts
+       WHERE marketplace = 'mercadolivre'
+         AND is_active = 1
+       ORDER BY updated_at DESC`
+    )
+    .all() as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
 async function refreshShopeeAccountToken(accountId: string): Promise<MarketplaceAccountRow | null> {
   const account = db
     .prepare(
@@ -2350,7 +2388,8 @@ async function recomputeMercadoLivreVariationFeeEstimate(variationId: string): P
     .prepare(
       `SELECT v.id, v.account_id, v.marketplace_item_id, v.variation_key, v.price_cents, v.effective_price_cents,
               COALESCE(v.currency_id, i.currency_id) AS currency_id,
-              i.site_id, i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id
+              i.site_id, i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+              i.shipping_mode, i.shipping_logistic_type
        FROM marketplace_catalog_variations v
        LEFT JOIN marketplace_catalog_items i
          ON i.account_id = v.account_id
@@ -2370,6 +2409,8 @@ async function recomputeMercadoLivreVariationFeeEstimate(variationId: string): P
         site_id: string | null;
         listing_type_id: string | null;
         category_id: string | null;
+        shipping_mode: string | null;
+        shipping_logistic_type: string | null;
       }
     | undefined;
 
@@ -2393,8 +2434,8 @@ async function recomputeMercadoLivreVariationFeeEstimate(variationId: string): P
     listingTypeId: row.listing_type_id ?? undefined,
     categoryId: row.category_id ?? undefined,
     currencyId: row.currency_id ?? undefined,
-    shippingMode: "me2",
-    logisticType: "self_service",
+    shippingMode: row.shipping_mode ?? "me2",
+    logisticType: row.shipping_logistic_type ?? "self_service",
     billableWeight: getLinkedSkuBillableWeightGrams({
       accountId: row.account_id,
       marketplaceItemId: row.marketplace_item_id,
@@ -2598,7 +2639,9 @@ app.get("/integrations/mercadolivre/status", async (_request, reply) => {
     )
     .all() as MarketplaceAccountRow[];
 
-  const accounts = [] as ReturnType<typeof toMarketplaceAccountResponse>[];
+  const accounts = [] as Array<ReturnType<typeof toMarketplaceAccountResponse> & {
+    scheduled_order_syncs: ReturnType<typeof getMercadoLivreOrderSchedulerStateForAccount>;
+  }>;
   const refreshErrors = [] as Array<{ account_id: string; message: string; status?: number; details?: unknown }>;
 
   for (const row of rows) {
@@ -2628,7 +2671,10 @@ app.get("/integrations/mercadolivre/status", async (_request, reply) => {
       }
     }
 
-    accounts.push(toMarketplaceAccountResponse(account));
+    accounts.push({
+      ...toMarketplaceAccountResponse(account),
+      scheduled_order_syncs: getMercadoLivreOrderSchedulerStateForAccount(account.id),
+    });
   }
 
   if (refreshErrors.length > 0) {
@@ -2800,6 +2846,12 @@ app.post("/integrations/mercadolivre/sync/catalog", async (request, reply) => {
     return { message: "Conta Mercado Livre ativa não encontrada." };
   }
 
+  if (marketplaceOrdersSyncRunningAccounts.has(account.id)) {
+    reply.code(409);
+    return { message: "Já existe uma sincronização de vendas em andamento para esta conta." };
+  }
+  marketplaceOrdersSyncRunningAccounts.add(account.id);
+
   const runId = uuidv4();
   const startedAt = nowIso();
   db.prepare(
@@ -2853,8 +2905,9 @@ app.post("/integrations/mercadolivre/sync/catalog", async (request, reply) => {
         thumbnail, currency_id, listing_type_id, category_id, price_cents, base_price_cents, promotion_price_cents,
         effective_price_cents, effective_currency_id, estimated_sale_fee_cents, estimated_listing_fee_cents,
         estimated_net_proceeds_cents, estimated_fee_currency_id, promotion_id, promotion_type,
-        available_quantity, sold_quantity, site_id, raw_json, last_seen_at, created_at, updated_at
-      ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        available_quantity, sold_quantity, site_id, shipping_mode, shipping_logistic_type, shipping_free,
+        shipping_tags_json, raw_json, last_seen_at, created_at, updated_at
+      ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(account_id, marketplace_item_id) DO UPDATE SET
         seller_id = excluded.seller_id,
         title = excluded.title,
@@ -2879,6 +2932,10 @@ app.post("/integrations/mercadolivre/sync/catalog", async (request, reply) => {
         available_quantity = excluded.available_quantity,
         sold_quantity = excluded.sold_quantity,
         site_id = excluded.site_id,
+        shipping_mode = excluded.shipping_mode,
+        shipping_logistic_type = excluded.shipping_logistic_type,
+        shipping_free = excluded.shipping_free,
+        shipping_tags_json = excluded.shipping_tags_json,
         raw_json = excluded.raw_json,
         last_seen_at = excluded.last_seen_at,
         updated_at = excluded.updated_at`
@@ -2963,8 +3020,8 @@ app.post("/integrations/mercadolivre/sync/catalog", async (request, reply) => {
                   listingTypeId: item.listingTypeId,
                   categoryId: item.categoryId,
                   currencyId: pricing?.currencyId ?? item.currencyId,
-                  shippingMode: "me2",
-                  logisticType: "self_service",
+                  shippingMode: item.shippingMode ?? "me2",
+                  logisticType: item.shippingLogisticType ?? "self_service",
                   billableWeight: itemBillableWeightGrams,
                 }).catch(() => null)
               : null;
@@ -3016,6 +3073,10 @@ app.post("/integrations/mercadolivre/sync/catalog", async (request, reply) => {
             item.availableQuantity ?? null,
             item.soldQuantity ?? null,
             item.siteId ?? null,
+            item.shippingMode ?? null,
+            item.shippingLogisticType ?? null,
+            typeof item.shippingFree === "boolean" ? (item.shippingFree ? 1 : 0) : null,
+            item.shippingTags ? JSON.stringify(item.shippingTags) : null,
             JSON.stringify(item.raw),
             now,
             now,
@@ -3049,8 +3110,8 @@ app.post("/integrations/mercadolivre/sync/catalog", async (request, reply) => {
                     listingTypeId: item.listingTypeId,
                     categoryId: item.categoryId,
                     currencyId: pricing?.currencyId ?? item.currencyId,
-                    shippingMode: "me2",
-                    logisticType: "self_service",
+                    shippingMode: item.shippingMode ?? "me2",
+                    logisticType: item.shippingLogisticType ?? "self_service",
                     billableWeight: getLinkedSkuBillableWeightGrams({
                       accountId: activeAccount.id,
                       marketplaceItemId: item.id,
@@ -3309,7 +3370,9 @@ app.get("/integrations/mercadolivre/catalog", async (request) => {
                   i.base_price_cents, i.promotion_price_cents, i.effective_price_cents, i.effective_currency_id,
                   i.estimated_sale_fee_cents, i.estimated_listing_fee_cents, i.estimated_net_proceeds_cents,
                   i.estimated_fee_currency_id, i.promotion_id, i.promotion_type,
-                  i.available_quantity, i.sold_quantity, i.site_id, i.last_seen_at, i.updated_at
+                  i.available_quantity, i.sold_quantity, i.site_id,
+                  i.shipping_mode, i.shipping_logistic_type, i.shipping_free, i.shipping_tags_json,
+                  i.last_seen_at, i.updated_at
            FROM marketplace_catalog_items i
            WHERE i.marketplace = 'mercadolivre'
              AND i.account_id = ?
@@ -3325,7 +3388,9 @@ app.get("/integrations/mercadolivre/catalog", async (request) => {
                   i.base_price_cents, i.promotion_price_cents, i.effective_price_cents, i.effective_currency_id,
                   i.estimated_sale_fee_cents, i.estimated_listing_fee_cents, i.estimated_net_proceeds_cents,
                   i.estimated_fee_currency_id, i.promotion_id, i.promotion_type,
-                  i.available_quantity, i.sold_quantity, i.site_id, i.last_seen_at, i.updated_at
+                  i.available_quantity, i.sold_quantity, i.site_id,
+                  i.shipping_mode, i.shipping_logistic_type, i.shipping_free, i.shipping_tags_json,
+                  i.last_seen_at, i.updated_at
            FROM marketplace_catalog_items i
            WHERE i.marketplace = 'mercadolivre'
              AND (? = '%%' OR i.title LIKE ? OR i.marketplace_item_id LIKE ?)
@@ -3351,6 +3416,7 @@ app.get("/integrations/mercadolivre/catalog/variations", async (request) => {
                   v.estimated_sale_fee_cents, v.estimated_listing_fee_cents, v.estimated_net_proceeds_cents,
                   v.available_quantity, v.sold_quantity, v.last_seen_at, v.updated_at, v.is_ignored,
                   i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+                  i.shipping_mode, i.shipping_logistic_type, i.shipping_free, i.shipping_tags_json,
                   v.linked_sku_id, s.sku_code AS linked_sku_code, s.name AS linked_sku_name, s.is_active AS linked_sku_is_active
            FROM marketplace_catalog_variations v
            LEFT JOIN marketplace_catalog_items i
@@ -3372,6 +3438,7 @@ app.get("/integrations/mercadolivre/catalog/variations", async (request) => {
                   v.estimated_sale_fee_cents, v.estimated_listing_fee_cents, v.estimated_net_proceeds_cents,
                   v.available_quantity, v.sold_quantity, v.last_seen_at, v.updated_at, v.is_ignored,
                   i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+                  i.shipping_mode, i.shipping_logistic_type, i.shipping_free, i.shipping_tags_json,
                   v.linked_sku_id, s.sku_code AS linked_sku_code, s.name AS linked_sku_name, s.is_active AS linked_sku_is_active
            FROM marketplace_catalog_variations v
            LEFT JOIN marketplace_catalog_items i
@@ -3467,6 +3534,7 @@ app.post("/integrations/mercadolivre/catalog/variations/link-sku", async (reques
               v.estimated_sale_fee_cents, v.estimated_listing_fee_cents, v.estimated_net_proceeds_cents,
               v.available_quantity, v.sold_quantity, v.last_seen_at, v.updated_at, v.is_ignored,
               i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+              i.shipping_mode, i.shipping_logistic_type, i.shipping_free, i.shipping_tags_json,
               v.linked_sku_id, s.sku_code AS linked_sku_code, s.name AS linked_sku_name, s.is_active AS linked_sku_is_active
        FROM marketplace_catalog_variations v
        LEFT JOIN marketplace_catalog_items i
@@ -3530,6 +3598,7 @@ app.post("/integrations/mercadolivre/catalog/variations/ignore", async (request,
               v.estimated_sale_fee_cents, v.estimated_listing_fee_cents, v.estimated_net_proceeds_cents,
               v.available_quantity, v.sold_quantity, v.last_seen_at, v.updated_at, v.is_ignored,
               i.listing_type_id, COALESCE(i.category_id, json_extract(i.raw_json, '$.category_id')) AS category_id,
+              i.shipping_mode, i.shipping_logistic_type, i.shipping_free, i.shipping_tags_json,
               v.linked_sku_id, s.sku_code AS linked_sku_code, s.name AS linked_sku_name, s.is_active AS linked_sku_is_active
        FROM marketplace_catalog_variations v
        LEFT JOIN marketplace_catalog_items i
@@ -3629,6 +3698,12 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
     reply.code(404);
     return { message: "Conta Mercado Livre ativa não encontrada." };
   }
+
+  if (marketplaceOrdersSyncRunningAccounts.has(account.id)) {
+    reply.code(409);
+    return { message: "Já existe uma sincronização de vendas em andamento para esta conta." };
+  }
+  marketplaceOrdersSyncRunningAccounts.add(account.id);
 
   const runId = uuidv4();
   const startedAt = nowIso();
@@ -3746,6 +3821,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
     let offset = 0;
     let remaining = Math.max(1, syncWindow.limit);
     let totalKnown = Number.MAX_SAFE_INTEGER;
+    let stoppedAtExistingOrder = false;
 
     beginSqlTransaction();
 
@@ -3764,12 +3840,28 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       totalKnown = Math.min(totalKnown, Math.max(0, page.total));
       if (!page.orders.length) break;
 
-      recordsRead += page.orders.length;
-
       const now = nowIso();
       for (const order of page.orders) {
         assertMarketplaceSyncNotCancelled(runId);
+        recordsRead += 1;
         try {
+          if (syncWindow.stopAtFirstImported) {
+            const existingOrder = db
+              .prepare(
+                `SELECT id
+                 FROM marketplace_orders
+                 WHERE account_id = ?
+                   AND marketplace_order_id = ?
+                 LIMIT 1`
+              )
+              .get(activeAccount.id, order.id) as { id: string } | undefined;
+            if (existingOrder) {
+              stoppedAtExistingOrder = true;
+              remaining = 0;
+              break;
+            }
+          }
+
           const detail = await fetchMercadoLivreOrderDetail({
             accessToken,
             orderId: order.id,
@@ -4082,6 +4174,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       "marketplace.sync.records_upserted": recordsUpserted,
       "marketplace.sync.records_failed": recordsFailed,
       "marketplace.sync.cancelled": false,
+      "marketplace.sync.stopped_at_existing_order": stoppedAtExistingOrder,
     });
 
     appendMarketplaceSyncLog({
@@ -4097,6 +4190,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
         sync_window: syncWindow.label,
         date_created_from: syncWindow.dateCreatedFrom,
         date_created_to: syncWindow.dateCreatedTo,
+        stopped_at_existing_order: stoppedAtExistingOrder,
       },
     });
 
@@ -4108,6 +4202,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       records_read: recordsRead,
       records_upserted: recordsUpserted,
       records_failed: recordsFailed,
+      stopped_at_existing_order: stoppedAtExistingOrder,
     };
   } catch (error: unknown) {
     rollbackSqlTransactionIfOpen();
@@ -4197,7 +4292,9 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
     };
       }
     }
-  );
+  ).finally(() => {
+    marketplaceOrdersSyncRunningAccounts.delete(account.id);
+  });
 });
 
 function loadMarketplaceOrderItemsWithCost(orderId: string) {
@@ -5017,6 +5114,17 @@ app.post("/uploads", async (request, reply) => {
   };
 });
 
+function normalizeSkuBarcodes(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function getSkuBarcodes(skuId: string): string[] {
+  const rows = db
+    .prepare("SELECT barcode_value FROM sales_sku_barcodes WHERE sku_id = ? ORDER BY created_at ASC")
+    .all(skuId) as Array<{ barcode_value: string }>;
+  return rows.map((row) => row.barcode_value);
+}
+
 app.get("/sales/skus", async () => {
   const rows = db
     .prepare(
@@ -5069,6 +5177,7 @@ app.get("/sales/skus", async () => {
             default_sale_price_cents: recomputed.finalUnitCents,
             production_cost_cents: recomputed.subtotalUnitCents,
             ...suggested,
+            barcodes: getSkuBarcodes(String(row.id)),
           },
           activeTaxRateBps,
           recomputed.taxUnitCents
@@ -5076,7 +5185,7 @@ app.get("/sales/skus", async () => {
       }
     }
     return withSkuContributionMargin(
-      row,
+      { ...row, barcodes: getSkuBarcodes(String(row.id)) },
       activeTaxRateBps,
       row.source_quote_id ? Number(row.source_quote_tax_cost_cents ?? 0) : undefined
     );
@@ -5150,6 +5259,7 @@ app.get("/sales/skus/:id", async (request, reply) => {
       activeTaxRateBps,
       resolvedSku.source_quote_id ? Number(resolvedSku.source_quote_tax_cost_cents ?? 0) : undefined
     ),
+    barcodes: getSkuBarcodes(id),
     media,
   };
 });
@@ -5172,6 +5282,7 @@ app.post("/sales/skus", async (request, reply) => {
   const now = nowIso();
   const skuCode = resolveUniqueSkuCode(body.sku_code ?? "");
   const syncWithQuotePricing = body.sync_with_quote_pricing === true ? 1 : 0;
+  const normalizedBarcodes = normalizeSkuBarcodes(body.barcodes);
 
   const parentSkuId = body.parent_sku_id?.trim() || null;
   if (parentSkuId) {
@@ -5323,13 +5434,21 @@ app.post("/sales/skus", async (request, reply) => {
     for (const item of persistedMedia) {
       insertMedia.run(item.id, item.sku_id, item.media_type, item.local_uri, item.created_at, item.updated_at);
     }
+
+    const insertBarcode = db.prepare(
+      `INSERT INTO sales_sku_barcodes (id, sku_id, barcode_value, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    for (const barcode of normalizedBarcodes) {
+      insertBarcode.run(uuidv4(), id, barcode, now, now);
+    }
   });
 
   tx();
   reply.code(201);
   const created = db.prepare("SELECT * FROM sales_skus WHERE id = ?").get(id) as any;
   return withSkuContributionMargin(
-    created,
+    { ...created, barcodes: getSkuBarcodes(id) },
     getActiveTaxRateBps(),
     recomputedFromQuote
       ? recomputedFromQuote.taxUnitCents
@@ -5344,8 +5463,10 @@ app.put("/sales/skus/:id", async (request, reply) => {
   const body = salesSkuSchema.parse(request.body);
   const rawBody = (request.body ?? {}) as Record<string, unknown>;
   const hasMediaField = Object.prototype.hasOwnProperty.call(rawBody, "media");
+  const hasBarcodesField = Object.prototype.hasOwnProperty.call(rawBody, "barcodes");
   const hasSyncField = Object.prototype.hasOwnProperty.call(rawBody, "sync_with_quote_pricing");
   const now = nowIso();
+  const normalizedBarcodes = normalizeSkuBarcodes(body.barcodes);
 
   const existing = db.prepare("SELECT * FROM sales_skus WHERE id = ?").get(id) as any;
   if (!existing) {
@@ -5527,12 +5648,23 @@ app.put("/sales/skus/:id", async (request, reply) => {
         insertMedia.run(item.id, item.sku_id, item.media_type, item.local_uri, item.created_at, item.updated_at);
       }
     }
+
+    if (hasBarcodesField) {
+      db.prepare("DELETE FROM sales_sku_barcodes WHERE sku_id = ?").run(id);
+      const insertBarcode = db.prepare(
+        `INSERT INTO sales_sku_barcodes (id, sku_id, barcode_value, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`
+      );
+      for (const barcode of normalizedBarcodes) {
+        insertBarcode.run(uuidv4(), id, barcode, now, now);
+      }
+    }
   });
 
   tx();
   const updated = db.prepare("SELECT * FROM sales_skus WHERE id = ?").get(id) as any;
   return withSkuContributionMargin(
-    updated,
+    { ...updated, barcodes: getSkuBarcodes(id) },
     getActiveTaxRateBps(),
     recomputedFromQuote
       ? recomputedFromQuote.taxUnitCents
@@ -6996,12 +7128,288 @@ app.delete("/quotes/:id", async (request, reply) => {
   return { ok: true };
 });
 
+type ScheduledMercadoLivreOrdersMode = "incremental" | "light" | "normal";
+type ScheduledMercadoLivreOrdersJob = {
+  mode: ScheduledMercadoLivreOrdersMode;
+  label: string;
+  intervalMinutes: number;
+};
+
+function parseSchedulerIntervalMinutes(envName: string, defaultMinutes: number): number {
+  const raw = (process.env[envName] ?? "").trim();
+  if (!raw) return defaultMinutes;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return defaultMinutes;
+  return parsed;
+}
+
+function isOrdersSchedulerEnabled(): boolean {
+  const raw = (process.env.ML_ORDERS_SYNC_SCHEDULER_ENABLED ?? "true").trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(raw);
+}
+
+function getMercadoLivreOrdersSchedulerJobs(): ScheduledMercadoLivreOrdersJob[] {
+  return [
+    {
+      mode: "incremental",
+      label: "últimas vendas",
+      intervalMinutes: parseSchedulerIntervalMinutes("ML_ORDERS_SYNC_INCREMENTAL_INTERVAL_MINUTES", 10),
+    },
+    {
+      mode: "light",
+      label: "últimas 48h",
+      intervalMinutes: parseSchedulerIntervalMinutes("ML_ORDERS_SYNC_48H_INTERVAL_MINUTES", 120),
+    },
+    {
+      mode: "normal",
+      label: "últimos 60 dias",
+      intervalMinutes: parseSchedulerIntervalMinutes("ML_ORDERS_SYNC_60D_INTERVAL_MINUTES", 1440),
+    },
+  ];
+}
+
+function parseSchedulerTickMs(): number {
+  const raw = (process.env.ML_ORDERS_SYNC_SCHEDULER_TICK_SECONDS ?? "").trim();
+  const parsed = raw ? Number(raw) : 60;
+  const seconds = Number.isFinite(parsed) && parsed >= 0 ? parsed : 60;
+  return Math.max(5, seconds) * 1000;
+}
+
+function getSchedulerStateRow(accountId: string, mode: ScheduledMercadoLivreOrdersMode) {
+  return db
+    .prepare(
+      `SELECT id, marketplace, account_id, mode, interval_minutes, last_started_at, last_finished_at,
+              last_status, last_run_id, last_message, updated_at
+       FROM marketplace_order_sync_scheduler_state
+       WHERE marketplace = 'mercadolivre'
+         AND account_id = ?
+         AND mode = ?`
+    )
+    .get(accountId, mode) as
+    | {
+        id: string;
+        marketplace: string;
+        account_id: string;
+        mode: ScheduledMercadoLivreOrdersMode;
+        interval_minutes: number;
+        last_started_at: string | null;
+        last_finished_at: string | null;
+        last_status: string | null;
+        last_run_id: string | null;
+        last_message: string | null;
+        updated_at: string;
+      }
+    | undefined;
+}
+
+function computeSchedulerNextRunAt(
+  lastStartedAt: string | null | undefined,
+  intervalMinutes: number
+): string | null {
+  if (intervalMinutes <= 0) return null;
+  const lastMs = Date.parse(lastStartedAt ?? "");
+  if (!Number.isFinite(lastMs)) return nowIso();
+  return new Date(lastMs + intervalMinutes * 60 * 1000).toISOString();
+}
+
+function isSchedulerJobDue(accountId: string, job: ScheduledMercadoLivreOrdersJob): boolean {
+  if (job.intervalMinutes <= 0) return false;
+  const state = getSchedulerStateRow(accountId, job.mode);
+  const lastMs = Date.parse(state?.last_started_at ?? "");
+  if (!Number.isFinite(lastMs)) return true;
+  return Date.now() - lastMs >= job.intervalMinutes * 60 * 1000;
+}
+
+function markSchedulerJobStarted(accountId: string, job: ScheduledMercadoLivreOrdersJob, startedAt: string): void {
+  db.prepare(
+    `INSERT INTO marketplace_order_sync_scheduler_state (
+      id, marketplace, account_id, mode, interval_minutes, last_started_at, last_finished_at,
+      last_status, last_run_id, last_message, updated_at
+    ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, NULL, 'running', NULL, NULL, ?)
+    ON CONFLICT(marketplace, account_id, mode) DO UPDATE SET
+      interval_minutes = excluded.interval_minutes,
+      last_started_at = excluded.last_started_at,
+      last_status = excluded.last_status,
+      last_message = NULL,
+      updated_at = excluded.updated_at`
+  ).run(uuidv4(), accountId, job.mode, Math.round(job.intervalMinutes), startedAt, startedAt);
+}
+
+function markSchedulerJobFinished(params: {
+  accountId: string;
+  job: ScheduledMercadoLivreOrdersJob;
+  finishedAt: string;
+  status: "success" | "error";
+  runId?: string | null;
+  message?: string | null;
+}): void {
+  db.prepare(
+    `INSERT INTO marketplace_order_sync_scheduler_state (
+      id, marketplace, account_id, mode, interval_minutes, last_started_at, last_finished_at,
+      last_status, last_run_id, last_message, updated_at
+    ) VALUES (?, 'mercadolivre', ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+    ON CONFLICT(marketplace, account_id, mode) DO UPDATE SET
+      interval_minutes = excluded.interval_minutes,
+      last_finished_at = excluded.last_finished_at,
+      last_status = excluded.last_status,
+      last_run_id = excluded.last_run_id,
+      last_message = excluded.last_message,
+      updated_at = excluded.updated_at`
+  ).run(
+    uuidv4(),
+    params.accountId,
+    params.job.mode,
+    Math.round(params.job.intervalMinutes),
+    params.finishedAt,
+    params.status,
+    params.runId ?? null,
+    params.message ?? null,
+    params.finishedAt
+  );
+}
+
+function getMercadoLivreOrderSchedulerStateForAccount(accountId: string) {
+  return getMercadoLivreOrdersSchedulerJobs().map((job) => {
+    const state = getSchedulerStateRow(accountId, job.mode);
+    return {
+      mode: job.mode,
+      label: job.label,
+      enabled: isOrdersSchedulerEnabled() && job.intervalMinutes > 0,
+      interval_minutes: job.intervalMinutes,
+      last_started_at: state?.last_started_at ?? null,
+      last_finished_at: state?.last_finished_at ?? null,
+      last_status: state?.last_status ?? null,
+      last_run_id: state?.last_run_id ?? null,
+      last_message: state?.last_message ?? null,
+      next_run_at: computeSchedulerNextRunAt(state?.last_started_at, job.intervalMinutes),
+    };
+  });
+}
+
+function startMercadoLivreOrdersScheduler(): NodeJS.Timeout[] {
+  if (!isOrdersSchedulerEnabled()) {
+    app.log.info("Mercado Livre orders scheduler disabled.");
+    return [];
+  }
+
+  const jobs = getMercadoLivreOrdersSchedulerJobs().filter((job) => job.intervalMinutes > 0);
+  if (jobs.length === 0) {
+    app.log.info("Mercado Livre orders scheduler has no enabled jobs.");
+    return [];
+  }
+
+  const runningKeys = new Set<string>();
+  const timers: NodeJS.Timeout[] = [];
+
+  const runJob = async (accountId: string, job: ScheduledMercadoLivreOrdersJob) => {
+    const key = accountId;
+    if (runningKeys.has(key)) {
+      app.log.info({ account_id: accountId, mode: job.mode }, "Skipping scheduled orders sync already running.");
+      return;
+    }
+    if (marketplaceOrdersSyncRunningAccounts.has(accountId)) {
+      app.log.info({ account_id: accountId, mode: job.mode }, "Skipping scheduled orders sync because account is busy.");
+      return;
+    }
+
+    runningKeys.add(key);
+    const startedAt = nowIso();
+    markSchedulerJobStarted(accountId, job, startedAt);
+
+    try {
+      app.log.info({ account_id: accountId, mode: job.mode }, "Starting scheduled Mercado Livre orders sync.");
+      const response = await app.inject({
+        method: "POST",
+        url: "/integrations/mercadolivre/sync/orders",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify({ account_id: accountId, mode: job.mode }),
+      });
+
+      const finishedAt = nowIso();
+      let parsed = {} as { run_id?: string; message?: string };
+      try {
+        parsed = response.json<{ run_id?: string; message?: string }>();
+      } catch {
+        parsed = {};
+      }
+      if (response.statusCode >= 400) {
+        markSchedulerJobFinished({
+          accountId,
+          job,
+          finishedAt,
+          status: "error",
+          runId: parsed.run_id ?? null,
+          message: parsed.message ?? response.body,
+        });
+        app.log.error(
+          { account_id: accountId, mode: job.mode, status_code: response.statusCode, body: response.body },
+          "Scheduled Mercado Livre orders sync failed."
+        );
+      } else {
+        markSchedulerJobFinished({
+          accountId,
+          job,
+          finishedAt,
+          status: "success",
+          runId: parsed.run_id ?? null,
+          message: null,
+        });
+        app.log.info(
+          { account_id: accountId, mode: job.mode, status_code: response.statusCode },
+          "Scheduled Mercado Livre orders sync finished."
+        );
+      }
+    } catch (error: any) {
+      markSchedulerJobFinished({
+        accountId,
+        job,
+        finishedAt: nowIso(),
+        status: "error",
+        message: error?.message ?? "Scheduled sync crashed.",
+      });
+      app.log.error({ account_id: accountId, mode: job.mode, error }, "Scheduled Mercado Livre orders sync crashed.");
+    } finally {
+      runningKeys.delete(key);
+    }
+  };
+
+  const tick = async () => {
+    const accountIds = listActiveMercadoLivreAccountIds();
+    if (accountIds.length === 0) return;
+
+    for (const accountId of accountIds) {
+      for (const job of jobs) {
+        if (runningKeys.has(accountId)) break;
+        if (!isSchedulerJobDue(accountId, job)) continue;
+        void runJob(accountId, job);
+        break;
+      }
+    }
+  };
+
+  const timer = setInterval(() => {
+    void tick();
+  }, parseSchedulerTickMs());
+  timers.push(timer);
+  void tick();
+
+  for (const job of jobs) {
+    app.log.info(
+      { mode: job.mode, label: job.label, interval_minutes: job.intervalMinutes },
+      "Mercado Livre orders scheduler job registered."
+    );
+  }
+
+  return timers;
+}
+
 const port = Number(process.env.PORT || 3333);
 
 app
   .listen({ port, host: "0.0.0.0" })
   .then(() => {
     app.log.info(`Backend running on http://localhost:${port}`);
+    startMercadoLivreOrdersScheduler();
   })
   .catch((error) => {
     app.log.error(error);

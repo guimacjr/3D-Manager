@@ -1,4 +1,4 @@
-import React, { ReactNode, useEffect, useMemo, useState } from "react";
+import React, { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   Linking,
   Modal,
@@ -124,6 +124,7 @@ type SalesSku = {
   sourceQuoteId?: string;
   parentSkuName?: string;
   sourceQuoteName?: string;
+  barcodes: string[];
   mediaPhotos: string[];
   mediaVideos: string[];
   media3mf: string[];
@@ -235,7 +236,20 @@ type OperationLogItem = {
   createdAt: string;
 };
 
-type MarketplaceOrdersSyncMode = "light" | "normal" | "full";
+type MarketplaceOrdersSyncMode = "incremental" | "light" | "normal" | "full";
+
+type MarketplaceScheduledOrderSync = {
+  mode: "incremental" | "light" | "normal";
+  label: string;
+  enabled: boolean;
+  interval_minutes: number;
+  last_started_at: string | null;
+  last_finished_at: string | null;
+  last_status: string | null;
+  last_run_id: string | null;
+  last_message: string | null;
+  next_run_at: string | null;
+};
 
 type MarketplaceAccountStatus = {
   id: string;
@@ -252,6 +266,7 @@ type MarketplaceAccountStatus = {
   updated_at: string;
   last_connected_at: string;
   last_token_refresh_at: string | null;
+  scheduled_order_syncs?: MarketplaceScheduledOrderSync[];
 };
 
 type MarketplaceStatusResponse = {
@@ -306,6 +321,10 @@ type MarketplaceCatalogVariationItem = {
   estimated_net_proceeds_cents: number | null;
   listing_type_id: string | null;
   category_id: string | null;
+  shipping_mode: string | null;
+  shipping_logistic_type: string | null;
+  shipping_free: number | null;
+  shipping_tags_json: string | null;
   available_quantity: number | null;
   sold_quantity: number | null;
   is_ignored: number | null;
@@ -989,6 +1008,7 @@ function mapSalesSkuFromApi(row: any): SalesSku {
     sourceQuoteId: row.source_quote_id ?? undefined,
     parentSkuName: row.parent_sku_name ?? undefined,
     sourceQuoteName: row.source_quote_name ?? undefined,
+    barcodes: Array.isArray(row.barcodes) ? row.barcodes : [],
     media3mf,
     mediaPhotos,
     mediaVideos,
@@ -1550,6 +1570,8 @@ function Field({
   keyboardType,
   multiline,
   editable,
+  onSubmitEditing,
+  keepFocusOnSubmit,
 }: {
   label: string;
   value: string;
@@ -1557,7 +1579,10 @@ function Field({
   keyboardType?: "default" | "numeric";
   multiline?: boolean;
   editable?: boolean;
+  onSubmitEditing?: () => void;
+  keepFocusOnSubmit?: boolean;
 }) {
+  const inputRef = useRef<TextInput>(null);
   const isCurrencyField = label.includes("R$");
   const [isFocused, setIsFocused] = useState(false);
   const displayValue = isCurrencyField && !isFocused ? normalizeCurrencyValue(value) : value;
@@ -1605,6 +1630,15 @@ function Field({
         inputMode={resolvedInputMode}
         multiline={multiline}
         editable={editable !== false}
+        blurOnSubmit={keepFocusOnSubmit ? false : undefined}
+        onSubmitEditing={() => {
+          onSubmitEditing?.();
+          if (keepFocusOnSubmit) {
+            requestAnimationFrame(() => inputRef.current?.focus());
+          }
+        }}
+        returnKeyType={onSubmitEditing ? "done" : undefined}
+        ref={inputRef}
       />
     </View>
   );
@@ -3182,6 +3216,11 @@ function SalesSkusScreen({
           <Text style={styles.text}>
             Sync preço com orçamento: {sku.syncWithQuotePricing ? "Ativo" : "Inativo"}
           </Text>
+          {sku.barcodes.length > 0 ? (
+            <Text style={styles.text}>
+              Códigos de barras: {sku.barcodes.map((barcode) => maskSensitiveText(barcode, isPrivacyMode, PRIVACY_MASK)).join(", ")}
+            </Text>
+          ) : null}
           <Text style={styles.text}>Preco padrão: {money(sku.defaultSalePriceCents)}</Text>
           <Text style={styles.text}>Custo produção: {money(sku.productionCostCents)}</Text>
           <Text style={styles.text}>Imposto estimado: {money(estimatedTaxCents)}</Text>
@@ -3250,6 +3289,8 @@ function SalesSkuFormScreen({
 }) {
   const [skuDraftId, setSkuDraftId] = useState(initialData?.id ?? createId("sales-sku"));
   const [skuCode, setSkuCode] = useState(initialData?.skuCode ?? generateInternalSkuCode());
+  const [barcodeDraft, setBarcodeDraft] = useState("");
+  const [barcodes, setBarcodes] = useState<string[]>(initialData?.barcodes ?? []);
   const [name, setName] = useState(initialData?.name ?? "");
   const [description, setDescription] = useState(initialData?.description ?? "");
   const [finalSalePrice, setFinalSalePrice] = useState(
@@ -3281,6 +3322,8 @@ function SalesSkuFormScreen({
   useEffect(() => {
     setSkuDraftId(initialData?.id ?? createId("sales-sku"));
     setSkuCode(initialData?.skuCode ?? generateInternalSkuCode());
+    setBarcodeDraft("");
+    setBarcodes(initialData?.barcodes ?? []);
     setName(initialData?.name ?? "");
     setDescription(initialData?.description ?? "");
     setFinalSalePrice(initialData ? String(initialData.defaultSalePriceCents / 100) : "");
@@ -3462,6 +3505,13 @@ function SalesSkuFormScreen({
     }
   };
 
+  const addBarcode = () => {
+    const value = barcodeDraft.trim();
+    if (!value) return;
+    setBarcodes((prev) => (prev.includes(value) ? prev : [...prev, value]));
+    setBarcodeDraft("");
+  };
+
   const handleSave = () => {
     const parsedDefaultPrice = Math.round(parseLocaleNumber(finalSalePrice) * 100);
     const parsedProductionCost = Math.round(parseLocaleNumber(productionCost) * 100);
@@ -3504,6 +3554,7 @@ function SalesSkuFormScreen({
         suggestedWholesaleCashPriceCents: Number.isFinite(parsedWholesaleCashPrice) ? parsedWholesaleCashPrice : 0,
         parentSkuId: parentSkuId || undefined,
         sourceQuoteId: linkedQuoteId || undefined,
+        barcodes,
         media3mf: media3mfList,
         mediaPhotos,
         mediaVideos,
@@ -3522,6 +3573,35 @@ function SalesSkuFormScreen({
       >
         <Text style={styles.secondaryButtonText}>Gerar novo codigo</Text>
       </Pressable>
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Códigos de barras</Text>
+        <Field
+          label="Código de barras"
+          value={barcodeDraft}
+          onChangeText={setBarcodeDraft}
+          keyboardType="numeric"
+        />
+        <Pressable style={styles.secondaryButton} onPress={addBarcode}>
+          <Text style={styles.secondaryButtonText}>Adicionar código</Text>
+        </Pressable>
+        {barcodes.length === 0 ? (
+          <Text style={styles.text}>Nenhum código cadastrado.</Text>
+        ) : (
+          barcodes.map((barcode) => (
+            <View key={barcode} style={styles.row}>
+              <Text style={styles.text}>{maskSensitiveText(barcode, isPrivacyMode, PRIVACY_MASK)}</Text>
+              <Pressable
+                style={styles.dangerButton}
+                onPress={() => setBarcodes((prev) => prev.filter((item) => item !== barcode))}
+              >
+                <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
+                  Remover
+                </Text>
+              </Pressable>
+            </View>
+          ))
+        )}
+      </View>
       <Field label="Nome" value={name} onChangeText={setName} />
       <Field label="Descricao" value={description} onChangeText={setDescription} multiline />
       <SelectField
@@ -3884,7 +3964,7 @@ function SalesStockScreen({
     quantityDelta: number;
     occurredAt: string;
     notes: string;
-  }) => void;
+  }) => Promise<void>;
   onFetchSkuMovements: (skuId: string) => Promise<StockMovementHistoryItem[]>;
   isPrivacyMode: boolean;
 }) {
@@ -3897,6 +3977,11 @@ function SalesStockScreen({
   const [isDateModalVisible, setIsDateModalVisible] = useState(false);
   const [calendarCursor, setCalendarCursor] = useState(new Date());
   const [notes, setNotes] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+  const [bulkSearch, setBulkSearch] = useState("");
+  const [bulkMovementType, setBulkMovementType] = useState<"adjustment_in" | "adjustment_out">("adjustment_in");
+  const [bulkItems, setBulkItems] = useState<Array<{ skuId: string; quantity: string }>>([]);
+  const [isBulkSubmitting, setIsBulkSubmitting] = useState(false);
   const [isMovementHistoryVisible, setIsMovementHistoryVisible] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -3913,6 +3998,69 @@ function SalesStockScreen({
   const movementLabelMap: Record<string, string> = {
     adjustment_in: "Ajuste entrada",
     adjustment_out: "Ajuste saída",
+  };
+  const findSkuForBulkSearch = (raw: string): SalesSku | undefined => {
+    const query = raw.trim().toLowerCase();
+    if (!query) return undefined;
+
+    return (
+      skus.find((item) => item.skuCode.toLowerCase() === query) ??
+      skus.find((item) => item.barcodes.some((barcode) => barcode.toLowerCase() === query)) ??
+      skus.find((item) => item.name.toLowerCase() === query) ??
+      skus.find((item) => item.name.toLowerCase().includes(query) || item.skuCode.toLowerCase().includes(query))
+    );
+  };
+  const addBulkItemFromSearch = () => {
+    const sku = findSkuForBulkSearch(bulkSearch);
+    if (!sku) {
+      setFormError("Produto não encontrado pelo nome, SKU ou código de barras.");
+      return;
+    }
+
+    setBulkItems((prev) => {
+      const existing = prev.find((item) => item.skuId === sku.id);
+      if (existing) {
+        const nextQuantity = Math.max(1, Math.round(parseLocaleNumber(existing.quantity) || 0) + 1);
+        return prev.map((item) => (item.skuId === sku.id ? { ...item, quantity: String(nextQuantity) } : item));
+      }
+      return [...prev, { skuId: sku.id, quantity: "1" }];
+    });
+    setBulkSearch("");
+    setFormError(null);
+  };
+  const submitBulkMovements = async () => {
+    if (bulkItems.length === 0 || isBulkSubmitting) return;
+
+    const parsedItems = bulkItems.map((item) => ({
+      ...item,
+      quantityNumber: Math.round(parseLocaleNumber(item.quantity)),
+    }));
+    if (parsedItems.some((item) => !Number.isFinite(item.quantityNumber) || item.quantityNumber <= 0)) {
+      setFormError("Informe quantidades válidas para todos os produtos da movimentação em massa.");
+      return;
+    }
+
+    setIsBulkSubmitting(true);
+    setFormError(null);
+    try {
+      for (const item of parsedItems) {
+        const quantityDelta =
+          bulkMovementType === "adjustment_out" ? -Math.abs(item.quantityNumber) : Math.abs(item.quantityNumber);
+        await onCreateMovement({
+          skuId: item.skuId,
+          movementType: bulkMovementType,
+          quantityDelta,
+          occurredAt: occurredAt.trim(),
+          notes: notes.trim(),
+        });
+      }
+      setBulkItems([]);
+      setBulkSearch("");
+    } catch (error: any) {
+      setFormError(error?.message ?? "Falha ao registrar movimentações em massa.");
+    } finally {
+      setIsBulkSubmitting(false);
+    }
   };
   const historyTypeLabel: Record<string, string> = {
     adjustment_in: "Entrada",
@@ -3994,7 +4142,7 @@ function SalesStockScreen({
             if (!skuId || !Number.isFinite(parsedQuantity) || parsedQuantity <= 0) return;
 
             const signedQuantity = movementType === "adjustment_out" ? -Math.abs(parsedQuantity) : parsedQuantity;
-            onCreateMovement({
+            void onCreateMovement({
               skuId,
               movementType,
               quantityDelta: signedQuantity,
@@ -4010,6 +4158,82 @@ function SalesStockScreen({
             Registrar movimento
           </Text>
         </Pressable>
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Movimentação em massa</Text>
+        <Field
+          label="Produto, SKU ou código de barras"
+          value={bulkSearch}
+          onChangeText={setBulkSearch}
+          onSubmitEditing={addBulkItemFromSearch}
+          keepFocusOnSubmit
+        />
+        <Pressable style={styles.secondaryButton} onPress={addBulkItemFromSearch}>
+          <Text allowFontScaling={false} numberOfLines={1} style={styles.secondaryButtonText}>
+            Adicionar produto
+          </Text>
+        </Pressable>
+        {bulkItems.length === 0 ? (
+          <Text style={styles.text}>Nenhum produto na lista.</Text>
+        ) : (
+          bulkItems.map((item) => {
+            const sku = skus.find((candidate) => candidate.id === item.skuId);
+            const label = maskSensitiveComposite([sku?.skuCode, sku?.name], isPrivacyMode, PRIVACY_MASK);
+            return (
+              <View key={item.skuId} style={styles.bulkMovementRow}>
+                <Text numberOfLines={1} ellipsizeMode="tail" style={styles.bulkMovementProductText}>
+                  {label}
+                </Text>
+                <TextInput
+                  value={item.quantity}
+                  onChangeText={(value) =>
+                    setBulkItems((prev) =>
+                      prev.map((candidate) =>
+                        candidate.skuId === item.skuId ? { ...candidate, quantity: value } : candidate
+                      )
+                    )
+                  }
+                  keyboardType="numeric"
+                  inputMode="numeric"
+                  style={styles.bulkMovementQuantityInput}
+                />
+                <Pressable
+                  style={styles.bulkMovementRemoveButton}
+                  onPress={() => setBulkItems((prev) => prev.filter((candidate) => candidate.skuId !== item.skuId))}
+                >
+                  <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
+                    Remover
+                  </Text>
+                </Pressable>
+              </View>
+            );
+          })
+        )}
+        <View style={styles.row}>
+          <Pressable
+            style={bulkMovementType === "adjustment_in" ? styles.smallButton : styles.secondaryButton}
+            onPress={() => setBulkMovementType("adjustment_in")}
+          >
+            <Text style={bulkMovementType === "adjustment_in" ? styles.smallButtonText : styles.secondaryButtonText}>
+              Entrada
+            </Text>
+          </Pressable>
+          <Pressable
+            style={bulkMovementType === "adjustment_out" ? styles.smallButton : styles.secondaryButton}
+            onPress={() => setBulkMovementType("adjustment_out")}
+          >
+            <Text style={bulkMovementType === "adjustment_out" ? styles.smallButtonText : styles.secondaryButtonText}>
+              Saída
+            </Text>
+          </Pressable>
+        </View>
+        <Pressable style={styles.primaryButtonFixed} onPress={() => void submitBulkMovements()}>
+          <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+            {isBulkSubmitting ? "Registrando..." : "Registrar movimentações em massa"}
+          </Text>
+        </Pressable>
+        {formError ? <Text style={styles.errorText}>{formError}</Text> : null}
       </View>
 
       <Modal
@@ -6183,6 +6407,13 @@ function MarketplacesScreen({
                           : "Expirado"}
                     </Text>
                   </View>
+                  <Text style={styles.text}>Sincronizações automáticas:</Text>
+                  {(account.scheduled_order_syncs ?? []).map((sync) => (
+                    <Text key={`${account.id}-${sync.mode}`} style={styles.text}>
+                      - {sync.label}: última {sync.last_started_at ? dateTime(sync.last_started_at) : "-"} | status{" "}
+                      {sync.last_status || "-"} | próxima {sync.next_run_at ? dateTime(sync.next_run_at) : "-"}
+                    </Text>
+                  ))}
 
                   <View style={styles.row}>
                     <Pressable
@@ -6192,6 +6423,15 @@ function MarketplacesScreen({
                     >
                       <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
                         Sync anúncios
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.smallButton, isBusy && styles.buttonDisabled]}
+                      onPress={() => onSyncOrders(account.id, "incremental")}
+                      disabled={isBusy}
+                    >
+                      <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                        Últimas vendas
                       </Text>
                     </Pressable>
                     <Pressable
@@ -6264,6 +6504,9 @@ function MarketplacesScreen({
                               </Text>
                               <Text style={styles.text}>Listing type ID: {item.listing_type_id || "-"}</Text>
                               <Text style={styles.text}>Category ID: {item.category_id || "-"}</Text>
+                              <Text style={styles.text}>
+                                Logística: {item.shipping_logistic_type || "-"} | Modo: {item.shipping_mode || "-"} | Frete grátis: {Number(item.shipping_free ?? 0) === 1 ? "Sim" : "Não"}
+                              </Text>
                               <Text style={styles.text}>Variação: {item.variation_label || "-"}</Text>
                               <Text style={styles.text}>Preço efetivo: {item.effective_price_cents !== null ? money(item.effective_price_cents) : "-"}</Text>
                               <Text style={styles.text}>Estoque: {item.available_quantity ?? "-"}</Text>
@@ -7547,7 +7790,13 @@ export default function MockupApp() {
     void (async () => {
       try {
         const modeLabel =
-          mode === "light" ? "últimas 48h" : mode === "normal" ? "últimos 60 dias" : "último ano";
+          mode === "incremental"
+            ? "últimas vendas"
+            : mode === "light"
+              ? "últimas 48h"
+              : mode === "normal"
+                ? "últimos 60 dias"
+                : "último ano";
         setIsMarketplaceBusy(true);
         setSyncError(null);
         setMarketplaceInfo(null);
@@ -7558,6 +7807,7 @@ export default function MockupApp() {
           records_read: number;
           records_upserted: number;
           records_failed: number;
+          stopped_at_existing_order?: boolean;
         }>("/integrations/mercadolivre/sync/orders", {
           method: "POST",
           body: JSON.stringify({ mode, account_id: accountId ?? "" }),
@@ -7574,6 +7824,8 @@ export default function MockupApp() {
         setMarketplaceInfo(
           result.cancelled
             ? `Sync de pedidos (${modeLabel}) interrompido. Alterações revertidas. Lidos antes da interrupção: ${result.records_read}.`
+            : result.stopped_at_existing_order
+              ? `Sync de pedidos (${modeLabel}) concluído até encontrar pedido já importado. Lidos: ${result.records_read}, novos/atualizados: ${result.records_upserted}, falhas: ${result.records_failed}.`
             : `Sync de pedidos (${modeLabel}) concluído. Lidos: ${result.records_read}, atualizados: ${result.records_upserted}, falhas: ${result.records_failed}.`
         );
       } catch (error: any) {
@@ -8337,6 +8589,7 @@ export default function MockupApp() {
                   sync_with_quote_pricing: sku.syncWithQuotePricing,
                   copy_from_quote: options.copyFromQuote,
                   copy_media_from_quote: options.copyMediaFromQuote,
+                  barcodes: sku.barcodes,
                   media: [
                     ...sku.media3mf.map((uri) => ({ media_type: "3mf", local_uri: uri })),
                     ...sku.mediaPhotos.map((uri) => ({ media_type: "photo", local_uri: uri })),
@@ -8447,8 +8700,7 @@ export default function MockupApp() {
         <SalesStockScreen
           stock={salesStock}
           skus={salesSkus}
-          onCreateMovement={({ skuId, movementType, quantityDelta, occurredAt, notes }) => {
-            void (async () => {
+          onCreateMovement={async ({ skuId, movementType, quantityDelta, occurredAt, notes }) => {
               try {
                 await apiFetch("/sales/stock/movements", {
                   method: "POST",
@@ -8463,8 +8715,8 @@ export default function MockupApp() {
                 await Promise.all([fetchSalesStock(), fetchLogs()]);
               } catch (error: any) {
                 setSyncError(error?.message ?? "Falha ao registrar movimento de estoque");
+                throw error;
               }
-            })();
           }}
           onFetchSkuMovements={async (skuId) => {
             const rows = await apiFetch<any[]>(`/sales/stock/movements/${skuId}`);
@@ -9563,6 +9815,40 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 8,
     flexWrap: "wrap",
+  },
+  bulkMovementRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "nowrap",
+  },
+  bulkMovementProductText: {
+    flex: 1,
+    minWidth: 0,
+    color: "#3d4863",
+    fontSize: 14,
+  },
+  bulkMovementQuantityInput: {
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#d9e0ef",
+    borderRadius: 10,
+    color: "#1c2438",
+    fontSize: 14,
+    height: 40,
+    paddingHorizontal: 10,
+    textAlign: "center",
+    width: 72,
+  },
+  bulkMovementRemoveButton: {
+    ...APP_BUTTON_THEME.danger.inactive,
+    borderWidth: 1,
+    height: 40,
+    width: 92,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
   },
   appButtonBase: {
     borderWidth: 1,
