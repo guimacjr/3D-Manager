@@ -184,6 +184,23 @@ type MercadoLivreOrderDetailResponse = {
   }>;
 };
 
+type MercadoLivrePackResponse = {
+  id?: number | string;
+  orders?: Array<{
+    id?: number | string;
+    order_id?: number | string;
+  }>;
+  order_ids?: Array<number | string>;
+  related_orders?: Array<{
+    id?: number | string;
+    order_id?: number | string;
+  }>;
+  pack_orders?: Array<{
+    id?: number | string;
+    order_id?: number | string;
+  }>;
+};
+
 type MercadoLivreShipmentResponse = {
   id?: number;
   status?: string;
@@ -353,6 +370,7 @@ export type MercadoLivreOrderBillingFinancials = {
   taxesTotal?: number;
   shippingCost?: number;
   shippingCompensation?: number;
+  buyerShippingPaid?: number;
   netAmount?: number;
   raw: unknown;
 };
@@ -985,6 +1003,55 @@ export async function fetchMercadoLivreOrderDetail(params: {
   };
 }
 
+function extractMercadoLivrePackOrderIds(payload: unknown): string[] {
+  const ids = new Set<string>();
+  const addId = (value: unknown) => {
+    if (value === undefined || value === null || value === "") return;
+    ids.add(String(value));
+  };
+  const addOrderLike = (value: unknown) => {
+    if (!value || typeof value !== "object") return;
+    const item = value as { id?: unknown; order_id?: unknown };
+    addId(item.id ?? item.order_id);
+  };
+  const addArray = (value: unknown, handler: (item: unknown) => void) => {
+    if (!Array.isArray(value)) return;
+    for (const item of value) handler(item);
+  };
+
+  if (Array.isArray(payload)) {
+    addArray(payload, addOrderLike);
+    return Array.from(ids);
+  }
+
+  if (!payload || typeof payload !== "object") return [];
+  const pack = payload as MercadoLivrePackResponse;
+  addArray(pack.orders, addOrderLike);
+  addArray(pack.order_ids, addId);
+  addArray(pack.related_orders, addOrderLike);
+  addArray(pack.pack_orders, addOrderLike);
+  return Array.from(ids);
+}
+
+export async function fetchMercadoLivrePackOrderIds(params: {
+  accessToken: string;
+  packId: string;
+}): Promise<string[]> {
+  const response = await mercadoLivreFetch(`${ML_API_BASE_URL}/packs/${encodeURIComponent(params.packId)}`, {
+    headers: {
+      authorization: `Bearer ${params.accessToken}`,
+      accept: "application/json",
+    },
+  });
+
+  const parsed = await parseApiResponse(response);
+  if (!response.ok) {
+    throw new MercadoLivreApiError("Mercado Livre pack fetch failed", response.status, parsed);
+  }
+
+  return extractMercadoLivrePackOrderIds(parsed);
+}
+
 export async function fetchMercadoLivreShipmentDetail(params: {
   accessToken: string;
   shipmentId: string;
@@ -1021,7 +1088,7 @@ export async function fetchMercadoLivreShipmentDetail(params: {
 export async function fetchMercadoLivreShipmentCosts(params: {
   accessToken: string;
   shipmentId: string;
-}): Promise<{ shippingCost?: number; shippingCompensation?: number; raw: unknown } | null> {
+}): Promise<{ shippingCost?: number; shippingCompensation?: number; buyerShippingPaid?: number; raw: unknown } | null> {
   const response = await mercadoLivreFetch(`${ML_API_BASE_URL}/shipments/${encodeURIComponent(params.shipmentId)}/costs`, {
     headers: {
       authorization: `Bearer ${params.accessToken}`,
@@ -1047,6 +1114,7 @@ export async function fetchMercadoLivreShipmentCosts(params: {
   return {
     shippingCost: senderCost + receiverCost,
     shippingCompensation: senderCompensation,
+    buyerShippingPaid: receiverCost > 0 ? receiverCost : undefined,
     raw: costs,
   };
 }
@@ -1120,9 +1188,19 @@ export async function fetchMercadoLivreOrderBillingDetail(params: {
   const details = Array.isArray(entry.details) ? entry.details : [];
   let shippingCost = 0;
   let shippingCompensation = 0;
+  let buyerShippingPaid = 0;
   for (const detail of details) {
     if (!detail || typeof detail !== "object") continue;
     const detailObj = detail as Record<string, unknown>;
+    const shippingInfo =
+      detailObj.shipping_info && typeof detailObj.shipping_info === "object" && !Array.isArray(detailObj.shipping_info)
+        ? (detailObj.shipping_info as Record<string, unknown>)
+        : null;
+    buyerShippingPaid = Math.max(
+      buyerShippingPaid,
+      asFiniteNumber(shippingInfo?.receiver_shipping_cost) ?? 0
+    );
+
     const amount =
       asFiniteNumber(detailObj.amount) ??
       asFiniteNumber(detailObj.value) ??
@@ -1188,6 +1266,7 @@ export async function fetchMercadoLivreOrderBillingDetail(params: {
     taxesTotal: taxesTotal > 0 ? taxesTotal : undefined,
     shippingCost: shippingCost > 0 ? shippingCost : undefined,
     shippingCompensation: shippingCompensation > 0 ? shippingCompensation : undefined,
+    buyerShippingPaid: buyerShippingPaid > 0 ? buyerShippingPaid : undefined,
     netAmount,
     raw: parsed,
   };
@@ -1368,8 +1447,7 @@ export async function fetchMercadoLivreProductAdsMetrics(params: {
     url.searchParams.set("aggregation_type", "daily");
     url.searchParams.set("limit", String(limit));
     url.searchParams.set("offset", String(offset));
-    url.searchParams.set("metrics", "cost,prints,impressions,clicks,orders,units_quantity,direct_amount,total_amount");
-
+    url.searchParams.set("metrics", "prints,clicks,cost,total_amount,units_quantity");
     const response = await mercadoLivreFetch(url.toString(), {
       headers: {
         authorization: `Bearer ${params.accessToken}`,
@@ -1422,7 +1500,15 @@ export async function fetchMercadoLivreProductAdsMetrics(params: {
         current.cost += pickMetricValue(source, ["cost", "spent", "amount_spent", "consumed_budget", "investment"]);
         current.impressions += pickMetricValue(source, ["prints", "impressions"]);
         current.clicks += pickMetricValue(source, ["clicks"]);
-        current.orders += pickMetricValue(source, ["orders", "sales", "conversions", "units_quantity"]);
+        current.orders += pickMetricValue(source, [
+          "orders",
+          "sales",
+          "conversions",
+          "units_quantity",
+          "direct_units_quantity",
+          "indirect_units_quantity",
+          "advertising_items_quantity",
+        ]);
         current.revenue += pickMetricValue(source, ["direct_amount", "total_amount", "revenue", "sales_amount"]);
         metrics.set(date, current);
       }

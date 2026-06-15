@@ -780,6 +780,8 @@ const generateInternalSkuCode = () => {
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://localhost:3333";
 const WEEK_DAYS = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sab"];
 const MARKETPLACE_ORDERS_CHARTS_VISIBLE_COOKIE = "marketplace_orders_dashboard_charts_visible";
+const MARKETPLACE_ORDERS_STOCK_STATUSES_VISIBLE_COOKIE = "marketplace_orders_dashboard_stock_statuses_visible";
+const MARKETPLACE_ORDERS_PRODUCT_ADS_VISIBLE_COOKIE = "marketplace_orders_dashboard_product_ads_visible";
 
 function readCookieBoolean(key: string, fallback: boolean) {
   try {
@@ -5672,6 +5674,7 @@ type MarketplaceOrdersMetricKey =
   | "ordersCount"
   | "averageTicket"
   | "unitsSold";
+type MarketplaceProductAdsMetricKey = "cost" | "impressions" | "clicks" | "orders" | "revenue";
 type MarketplaceOrdersSortKey = "total_desc" | "total_asc" | "profit_desc" | "profit_asc" | "date_desc" | "date_asc";
 
 type MarketplaceOrdersSummary = {
@@ -5701,6 +5704,7 @@ function MarketplaceOrdersDashboardSection({
   onFetchOrdersDashboard,
   onRecalculateAllOrderSnapshots,
   onRecalculateSingleOrderSnapshot,
+  onRefreshSingleOrderFromApi,
   onOpenSkuLinking,
   isPrivacyMode,
 }: {
@@ -5713,6 +5717,7 @@ function MarketplaceOrdersDashboardSection({
   onFetchOrdersDashboard: (filters: { dateFrom: string; dateTo: string }) => Promise<void>;
   onRecalculateAllOrderSnapshots: () => void;
   onRecalculateSingleOrderSnapshot: (orderId: string) => void;
+  onRefreshSingleOrderFromApi: (orderId: string) => void;
   onOpenSkuLinking: (target: MarketplaceOrderSkuLinkTarget) => void;
   isPrivacyMode: boolean;
 }) {
@@ -5732,9 +5737,25 @@ function MarketplaceOrdersDashboardSection({
   const [areChartsVisible, setAreChartsVisible] = useState(() =>
     readCookieBoolean(MARKETPLACE_ORDERS_CHARTS_VISIBLE_COOKIE, true)
   );
-  const [areStockStatusesVisible, setAreStockStatusesVisible] = useState(true);
+  const [areStockStatusesVisible, setAreStockStatusesVisible] = useState(() =>
+    readCookieBoolean(MARKETPLACE_ORDERS_STOCK_STATUSES_VISIBLE_COOKIE, true)
+  );
+  const [areProductAdsVisible, setAreProductAdsVisible] = useState(() =>
+    readCookieBoolean(MARKETPLACE_ORDERS_PRODUCT_ADS_VISIBLE_COOKIE, true)
+  );
+  const [shouldDeductProductAdsCost, setShouldDeductProductAdsCost] = useState(false);
+  const [comparisonProductAdsCostCents, setComparisonProductAdsCostCents] = useState(0);
   const [selectedMetricChart, setSelectedMetricChart] = useState<MarketplaceOrdersMetricKey | null>(null);
+  const [selectedProductAdsMetric, setSelectedProductAdsMetric] = useState<MarketplaceProductAdsMetricKey>("cost");
   const [hoveredMetricPoint, setHoveredMetricPoint] = useState<{
+    x: number;
+    y: number;
+    label: string;
+    value: number;
+    seriesLabel: string;
+    color: string;
+  } | null>(null);
+  const [hoveredProductAdsPoint, setHoveredProductAdsPoint] = useState<{
     x: number;
     y: number;
     label: string;
@@ -5746,6 +5767,14 @@ function MarketplaceOrdersDashboardSection({
   useEffect(() => {
     writeCookieBoolean(MARKETPLACE_ORDERS_CHARTS_VISIBLE_COOKIE, areChartsVisible);
   }, [areChartsVisible]);
+
+  useEffect(() => {
+    writeCookieBoolean(MARKETPLACE_ORDERS_STOCK_STATUSES_VISIBLE_COOKIE, areStockStatusesVisible);
+  }, [areStockStatusesVisible]);
+
+  useEffect(() => {
+    writeCookieBoolean(MARKETPLACE_ORDERS_PRODUCT_ADS_VISIBLE_COOKIE, areProductAdsVisible);
+  }, [areProductAdsVisible]);
 
   const normalizedRange = useMemo(() => {
     const start = parseLocalDateKey(rangeStart);
@@ -5795,6 +5824,13 @@ function MarketplaceOrdersDashboardSection({
       label: `${formatLocalDateKey(startDate)} até ${formatLocalDateKey(endDate)}`,
     };
   }, [comparisonMode, normalizedRange]);
+  const comparisonProductAdsRange = useMemo(
+    () => ({
+      startKey: formatLocalDateKey(comparisonRange.startDate),
+      endKey: formatLocalDateKey(comparisonRange.endDate),
+    }),
+    [comparisonRange]
+  );
 
   useEffect(() => {
     void onFetchOrdersDashboard({
@@ -5802,6 +5838,27 @@ function MarketplaceOrdersDashboardSection({
       dateTo: normalizedRange.endKey,
     });
   }, [normalizedRange.startKey, normalizedRange.endKey]);
+
+  useEffect(() => {
+    let isMounted = true;
+    const params = new URLSearchParams();
+    params.set("date_from", comparisonProductAdsRange.startKey);
+    params.set("date_to", comparisonProductAdsRange.endKey);
+    void apiFetch<MarketplaceOrdersDashboardResponse>(`/integrations/mercadolivre/orders/dashboard?${params.toString()}`)
+      .then((dashboard) => {
+        if (isMounted) {
+          setComparisonProductAdsCostCents(dashboard.product_ads?.totals.cost_cents ?? 0);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setComparisonProductAdsCostCents(0);
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [comparisonProductAdsRange.startKey, comparisonProductAdsRange.endKey]);
 
   const logisticOptions = useMemo(() => {
     const values = new Map<string, string>();
@@ -5904,7 +5961,13 @@ function MarketplaceOrdersDashboardSection({
   const currentSummary = useMemo(() => summarizeOrders(currentOrders), [currentOrders, taxRatePercent]);
   const comparisonSummary = useMemo(() => summarizeOrders(comparisonOrders), [comparisonOrders, taxRatePercent]);
   const productAds = ordersDashboard?.product_ads ?? null;
-  const productAdsMaxCostCents = Math.max(1, ...(productAds?.daily ?? []).map((item) => item.cost_cents));
+  const productAdsCostCents = productAds?.totals.cost_cents ?? 0;
+  const displayedProfitCents = shouldDeductProductAdsCost
+    ? currentSummary.grossProfitCents - productAdsCostCents
+    : currentSummary.grossProfitCents;
+  const displayedComparisonProfitCents = shouldDeductProductAdsCost
+    ? comparisonSummary.grossProfitCents - comparisonProductAdsCostCents
+    : comparisonSummary.grossProfitCents;
   const logisticsChartColors = ["#1e3a79", "#0f766e", "#f59e0b", "#7c3aed", "#dc2626", "#4b5563"];
   const accountsById = useMemo(() => {
     const map = new Map<string, MarketplaceAccountStatus>();
@@ -6087,9 +6150,9 @@ function MarketplaceOrdersDashboardSection({
     {
       key: "grossProfit" as const,
       label: "Lucro",
-      value: money(currentSummary.grossProfitCents),
-      previousValue: comparisonSummary.grossProfitCents,
-      currentValue: currentSummary.grossProfitCents,
+      value: money(displayedProfitCents),
+      previousValue: displayedComparisonProfitCents,
+      currentValue: displayedProfitCents,
       formatter: money,
     },
     {
@@ -6118,6 +6181,61 @@ function MarketplaceOrdersDashboardSection({
     },
   ];
   const selectedMetric = metricCards.find((metric) => metric.key === selectedMetricChart) ?? null;
+  const productAdsMetricCards = [
+    {
+      key: "cost" as const,
+      label: "Gasto Mercado Ads",
+      value: money(productAds?.totals.cost_cents ?? 0),
+      currentValue: productAds?.totals.cost_cents ?? 0,
+      formatter: money,
+      dailyValue: (item: NonNullable<MarketplaceOrdersDashboardResponse["product_ads"]>["daily"][number]) => item.cost_cents,
+    },
+    {
+      key: "impressions" as const,
+      label: "Impressões",
+      value: String(productAds?.totals.impressions ?? 0),
+      currentValue: productAds?.totals.impressions ?? 0,
+      formatter: (value: number) => value.toLocaleString("pt-BR"),
+      dailyValue: (item: NonNullable<MarketplaceOrdersDashboardResponse["product_ads"]>["daily"][number]) => item.impressions,
+    },
+    {
+      key: "clicks" as const,
+      label: "Cliques",
+      value: String(productAds?.totals.clicks ?? 0),
+      currentValue: productAds?.totals.clicks ?? 0,
+      formatter: (value: number) => value.toLocaleString("pt-BR"),
+      dailyValue: (item: NonNullable<MarketplaceOrdersDashboardResponse["product_ads"]>["daily"][number]) => item.clicks,
+    },
+    {
+      key: "orders" as const,
+      label: "Compras Ads",
+      value: String(productAds?.totals.orders ?? 0),
+      currentValue: productAds?.totals.orders ?? 0,
+      formatter: (value: number) => value.toLocaleString("pt-BR"),
+      dailyValue: (item: NonNullable<MarketplaceOrdersDashboardResponse["product_ads"]>["daily"][number]) => item.orders,
+    },
+    {
+      key: "revenue" as const,
+      label: "Receita Ads",
+      value: money(productAds?.totals.revenue_cents ?? 0),
+      currentValue: productAds?.totals.revenue_cents ?? 0,
+      formatter: money,
+      dailyValue: (item: NonNullable<MarketplaceOrdersDashboardResponse["product_ads"]>["daily"][number]) => item.revenue_cents,
+    },
+  ];
+  const selectedProductAdsMetricCard =
+    productAdsMetricCards.find((metric) => metric.key === selectedProductAdsMetric) ?? productAdsMetricCards[0];
+  const productAdsChartData = useMemo(() => {
+    const rows = productAds?.daily ?? [];
+    const labels = rows.map((item) => item.date.slice(5));
+    const values = rows.map((item) => selectedProductAdsMetricCard.dailyValue(item));
+    return {
+      labels,
+      values,
+      maxValue: Math.max(1, ...values),
+      minValue: Math.min(0, ...values),
+    };
+  }, [productAds, selectedProductAdsMetricCard]);
   const metricChartData = useMemo(() => {
     if (!selectedMetricChart) return null;
     const current = buildMetricSeries(currentOrders, normalizedRange.startDate, normalizedRange.endDate, selectedMetricChart);
@@ -6131,6 +6249,8 @@ function MarketplaceOrdersDashboardSection({
   }, [selectedMetricChart, currentOrders, comparisonOrders, normalizedRange, comparisonRange]);
   const metricChartWidth = 680;
   const metricChartHeight = 180;
+  const productAdsLineChartWidth = 520;
+  const productAdsLineChartHeight = 140;
   const stockPendingItems = useMemo(() => {
     const items: Array<{
       order: MarketplaceOrderItem;
@@ -6290,59 +6410,36 @@ function MarketplaceOrdersDashboardSection({
             <Text style={styles.marketplaceMetricLabel}>{metric.label}</Text>
             <Text style={styles.marketplaceMetricValue}>{metric.value}</Text>
             {renderComparison(metric.currentValue, metric.previousValue, metric.formatter)}
+            {metric.key === "grossProfit" && shouldDeductProductAdsCost ? (
+              <Text style={styles.marketplaceMetricPrevious}>
+                Ads: {money(productAdsCostCents)} | anterior {money(comparisonProductAdsCostCents)}
+              </Text>
+            ) : null}
+            {metric.key === "grossProfit" ? (
+              <Pressable
+                style={[
+                  styles.marketplaceMetricInlineToggle,
+                  shouldDeductProductAdsCost && styles.marketplaceMetricInlineToggleActive,
+                ]}
+                onPress={(event) => {
+                  event.stopPropagation?.();
+                  setShouldDeductProductAdsCost((prev) => !prev);
+                }}
+              >
+                <Text
+                  allowFontScaling={false}
+                  numberOfLines={1}
+                  style={[
+                    styles.marketplaceMetricInlineToggleText,
+                    shouldDeductProductAdsCost && styles.marketplaceMetricInlineToggleTextActive,
+                  ]}
+                >
+                  descontar Ads
+                </Text>
+              </Pressable>
+            ) : null}
           </Pressable>
         ))}
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Product Ads no período</Text>
-        <View style={styles.marketplaceMetricGrid}>
-          <View style={styles.marketplaceMetricCard}>
-            <Text style={styles.marketplaceMetricLabel}>Gasto Mercado Ads</Text>
-            <Text style={styles.marketplaceMetricValue}>{money(productAds?.totals.cost_cents ?? 0)}</Text>
-          </View>
-          <View style={styles.marketplaceMetricCard}>
-            <Text style={styles.marketplaceMetricLabel}>Impressões</Text>
-            <Text style={styles.marketplaceMetricValue}>{productAds?.totals.impressions ?? 0}</Text>
-          </View>
-          <View style={styles.marketplaceMetricCard}>
-            <Text style={styles.marketplaceMetricLabel}>Cliques</Text>
-            <Text style={styles.marketplaceMetricValue}>{productAds?.totals.clicks ?? 0}</Text>
-          </View>
-          <View style={styles.marketplaceMetricCard}>
-            <Text style={styles.marketplaceMetricLabel}>Compras Ads</Text>
-            <Text style={styles.marketplaceMetricValue}>{productAds?.totals.orders ?? 0}</Text>
-          </View>
-        </View>
-        {productAds?.daily?.length ? (
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.productAdsChartScroll}>
-            {productAds.daily.map((item) => (
-              <View key={item.date} style={styles.productAdsBarWrap}>
-                <Text style={styles.productAdsBarValue}>{money(item.cost_cents)}</Text>
-                <View style={styles.productAdsBarTrack}>
-                  <View
-                    style={[
-                      styles.productAdsBarFill,
-                      { height: `${Math.max(4, (item.cost_cents / productAdsMaxCostCents) * 100)}%` },
-                    ]}
-                  />
-                </View>
-                <Text style={styles.productAdsBarLabel}>{item.date.slice(5)}</Text>
-              </View>
-            ))}
-          </ScrollView>
-        ) : (
-          <Text style={styles.text}>Sem dados de Product Ads para o período ou conta sem Mercado Ads habilitado.</Text>
-        )}
-        {productAds?.accounts?.some((item) => item.status !== "ok") ? (
-          <Text style={styles.marketplaceMetricPrevious}>
-            Algumas contas não retornaram Product Ads:{" "}
-            {productAds.accounts
-              .filter((item) => item.status !== "ok")
-              .map((item) => item.message ?? item.status)
-              .join(" | ")}
-          </Text>
-        ) : null}
       </View>
 
       {selectedMetric && metricChartData ? (
@@ -6444,7 +6541,157 @@ function MarketplaceOrdersDashboardSection({
           active={areStockStatusesVisible}
           onPress={() => setAreStockStatusesVisible((prev) => !prev)}
         />
+        <AppButton
+          label="Product Ads"
+          variant="small"
+          active={areProductAdsVisible}
+          onPress={() => setAreProductAdsVisible((prev) => !prev)}
+        />
       </View>
+
+      {areProductAdsVisible && (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Product Ads no período</Text>
+          <View style={styles.marketplaceMetricGrid}>
+            {productAdsMetricCards.map((metric) => (
+              <Pressable
+                key={metric.key}
+                style={[
+                  styles.marketplaceMetricCard,
+                  selectedProductAdsMetric === metric.key && styles.marketplaceMetricCardActive,
+                ]}
+                onPress={() => setSelectedProductAdsMetric(metric.key)}
+              >
+                <Text style={styles.marketplaceMetricLabel}>{metric.label}</Text>
+                <Text style={styles.marketplaceMetricValue}>{metric.value}</Text>
+              </Pressable>
+            ))}
+          </View>
+          {productAds?.daily?.length ? (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.productAdsLineChartScroll}>
+              <View style={styles.productAdsLineChartWrap}>
+                <Text style={styles.marketplaceMetricChartScale}>
+                  {selectedProductAdsMetricCard.label}: {selectedProductAdsMetricCard.formatter(productAdsChartData.minValue)} -{" "}
+                  {selectedProductAdsMetricCard.formatter(productAdsChartData.maxValue)}
+                </Text>
+                <View
+                  style={[
+                    styles.productAdsLineChartCanvas,
+                    { width: productAdsLineChartWidth, height: productAdsLineChartHeight },
+                  ]}
+                >
+                  <View style={styles.productAdsLineChartGridTop} />
+                  <View style={styles.productAdsLineChartGridMiddle} />
+                  <View style={styles.productAdsLineChartGridBottom} />
+                  {productAdsChartData.values.map((value, index, rows) => {
+                    const range = Math.max(1, productAdsChartData.maxValue - productAdsChartData.minValue);
+                    const xStep = rows.length > 1 ? productAdsLineChartWidth / (rows.length - 1) : 0;
+                    const x = rows.length > 1 ? index * xStep : productAdsLineChartWidth / 2;
+                    const y =
+                      productAdsLineChartHeight -
+                      ((value - productAdsChartData.minValue) / range) * productAdsLineChartHeight;
+                    const previous = index > 0 ? rows[index - 1] : null;
+                    const previousX = rows.length > 1 ? (index - 1) * xStep : productAdsLineChartWidth / 2;
+                    const previousY = previous
+                      ? productAdsLineChartHeight -
+                        ((previous - productAdsChartData.minValue) / range) * productAdsLineChartHeight
+                      : y;
+                    const dx = x - previousX;
+                    const dy = y - previousY;
+                    const length = Math.sqrt(dx * dx + dy * dy);
+                    const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+                    const label = productAdsChartData.labels[index] ?? "";
+                    return (
+                      <React.Fragment key={`${selectedProductAdsMetric}-${label}`}>
+                        {previous ? (
+                          <View
+                            style={[
+                              styles.marketplaceMetricChartSegment,
+                              {
+                                left: (previousX + x) / 2 - length / 2,
+                                top: (previousY + y) / 2 - 1.5,
+                                width: length,
+                                backgroundColor: "#0f766e",
+                                transform: [{ rotate: `${angle}deg` }],
+                              },
+                            ]}
+                          />
+                        ) : null}
+                        <Pressable
+                          onHoverIn={() =>
+                            setHoveredProductAdsPoint({
+                              x,
+                              y,
+                              label,
+                              value,
+                              seriesLabel: selectedProductAdsMetricCard.label,
+                              color: "#0f766e",
+                            })
+                          }
+                          onHoverOut={() => setHoveredProductAdsPoint(null)}
+                          onPressIn={() =>
+                            setHoveredProductAdsPoint({
+                              x,
+                              y,
+                              label,
+                              value,
+                              seriesLabel: selectedProductAdsMetricCard.label,
+                              color: "#0f766e",
+                            })
+                          }
+                          style={[
+                            styles.marketplaceMetricChartDot,
+                            {
+                              left: x - 4,
+                              top: y - 4,
+                              backgroundColor: "#0f766e",
+                            },
+                          ]}
+                        />
+                      </React.Fragment>
+                    );
+                  })}
+                  {hoveredProductAdsPoint ? (
+                    <View
+                      pointerEvents="none"
+                      style={[
+                        styles.marketplaceMetricChartTooltip,
+                        {
+                          left: Math.min(Math.max(hoveredProductAdsPoint.x - 74, 0), productAdsLineChartWidth - 148),
+                          top: Math.max(hoveredProductAdsPoint.y - 58, 0),
+                          borderColor: hoveredProductAdsPoint.color,
+                        },
+                      ]}
+                    >
+                      <Text style={styles.marketplaceMetricChartTooltipTitle}>{hoveredProductAdsPoint.seriesLabel}</Text>
+                      <Text style={styles.marketplaceMetricChartTooltipText}>
+                        {hoveredProductAdsPoint.label}: {selectedProductAdsMetricCard.formatter(hoveredProductAdsPoint.value)}
+                      </Text>
+                    </View>
+                  ) : null}
+                </View>
+                <View style={[styles.marketplaceMetricChartAxis, { width: productAdsLineChartWidth }]}>
+                  <Text style={styles.marketplaceMetricChartAxisText}>{productAdsChartData.labels[0] ?? ""}</Text>
+                  <Text style={styles.marketplaceMetricChartAxisText}>
+                    {productAdsChartData.labels[productAdsChartData.labels.length - 1] ?? ""}
+                  </Text>
+                </View>
+              </View>
+            </ScrollView>
+          ) : (
+            <Text style={styles.text}>Sem dados de Product Ads para o período ou conta sem Mercado Ads habilitado.</Text>
+          )}
+          {productAds?.accounts?.some((item) => item.status !== "ok") ? (
+            <Text style={styles.marketplaceMetricPrevious}>
+              Algumas contas não retornaram Product Ads:{" "}
+              {productAds.accounts
+                .filter((item) => item.status !== "ok")
+                .map((item) => item.message ?? item.status)
+                .join(" | ")}
+            </Text>
+          ) : null}
+        </View>
+      )}
 
       {areChartsVisible && <View style={styles.marketplaceChartsGrid}>
         <View style={[styles.card, styles.marketplaceChartCard]}>
@@ -6715,6 +6962,15 @@ function MarketplaceOrdersDashboardSection({
 	                        onPress={() => onRecalculateSingleOrderSnapshot(order.id)}
 	                        disabled={isBusy}
 	                      />
+                      <Pressable
+                        onPress={() => onRefreshSingleOrderFromApi(order.id)}
+                        disabled={isBusy}
+                        style={[styles.marketplaceOrderRefreshButton, isBusy && styles.buttonDisabled]}
+                      >
+                        <Text allowFontScaling={false} numberOfLines={1} style={styles.marketplaceOrderRefreshButtonText}>
+                          ↻
+                        </Text>
+                      </Pressable>
                       <AppButton
                         label="ir ao detalhe"
                         variant="small"
@@ -8848,6 +9104,33 @@ export default function MockupApp() {
 	    })();
 	  };
 
+  const handleRefreshSingleMarketplaceOrderFromApi = (orderId: string) => {
+    void (async () => {
+      try {
+        setIsMarketplaceBusy(true);
+        setSyncError(null);
+        setMarketplaceInfo(null);
+        const result = await apiFetch<{
+          marketplace_order_id: string;
+          records_read: number;
+          records_upserted: number;
+          records_failed: number;
+        }>(`/integrations/mercadolivre/orders/${orderId}/refresh`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        await Promise.all([fetchMarketplaceOrders(), fetchMarketplaceOrdersDashboard(), fetchLogs()]);
+        setMarketplaceInfo(
+          `Pedido ${result.marketplace_order_id} atualizado pela API. Lidos: ${result.records_read}, atualizados: ${result.records_upserted}, falhas: ${result.records_failed}.`
+        );
+      } catch (error: any) {
+        setSyncError(error?.message ?? "Falha ao atualizar pedido pela API");
+      } finally {
+        setIsMarketplaceBusy(false);
+      }
+    })();
+  };
+
 	  const handleOpenMarketplaceListingSkuConfig = (target: MarketplaceOrderSkuLinkTarget) => {
 	    const listing =
 	      (target.catalogVariationId
@@ -9933,6 +10216,7 @@ export default function MockupApp() {
 		            }
 		            onRecalculateAllOrderSnapshots={handleRecalculateAllMarketplaceOrderSnapshots}
 		            onRecalculateSingleOrderSnapshot={handleRecalculateSingleMarketplaceOrderSnapshot}
+		            onRefreshSingleOrderFromApi={handleRefreshSingleMarketplaceOrderFromApi}
 		            onOpenSkuLinking={handleOpenMarketplaceListingSkuConfig}
 		            isPrivacyMode={isPrivacyMode}
 		          />
@@ -10452,6 +10736,29 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: "#6b768f",
   },
+  marketplaceMetricInlineToggle: {
+    alignSelf: "flex-start",
+    minHeight: 24,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: "#d9e0ef",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    backgroundColor: "#f8fafc",
+  },
+  marketplaceMetricInlineToggleActive: {
+    borderColor: "#1e3a79",
+    backgroundColor: "#eef4ff",
+  },
+  marketplaceMetricInlineToggleText: {
+    fontSize: 11,
+    lineHeight: 14,
+    color: "#52627f",
+    fontWeight: "700",
+  },
+  marketplaceMetricInlineToggleTextActive: {
+    color: "#1e3a79",
+  },
   marketplaceMetricChartHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -10608,6 +10915,45 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "700",
   },
+  productAdsLineChartScroll: {
+    flexGrow: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingVertical: 12,
+  },
+  productAdsLineChartWrap: {
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 12,
+  },
+  productAdsLineChartCanvas: {
+    position: "relative",
+    marginHorizontal: 8,
+  },
+  productAdsLineChartGridTop: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 8,
+    height: 1,
+    backgroundColor: "#e6ebf5",
+  },
+  productAdsLineChartGridMiddle: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: 70,
+    height: 1,
+    backgroundColor: "#eef2f8",
+  },
+  productAdsLineChartGridBottom: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 8,
+    height: 1,
+    backgroundColor: "#e6ebf5",
+  },
   marketplaceChartsGrid: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -10757,6 +11103,23 @@ const styles = StyleSheet.create({
   marketplaceCompactOrderNumbers: {
     alignItems: "flex-end",
     gap: 4,
+  },
+  marketplaceOrderRefreshButton: {
+    width: 30,
+    height: 30,
+    borderRadius: 8,
+    backgroundColor: "#eef3ff",
+    borderWidth: 1,
+    borderColor: "#d9e0ef",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  marketplaceOrderRefreshButtonText: {
+    color: "#23407e",
+    fontSize: 16,
+    lineHeight: 18,
+    fontWeight: "800",
+    textAlign: "center",
   },
   marketplaceOrderRevenue: {
     fontSize: 15,

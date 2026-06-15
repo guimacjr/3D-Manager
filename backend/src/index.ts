@@ -24,6 +24,7 @@ import {
   fetchMercadoLivreListingFeeEstimate,
   fetchMercadoLivreOrderBillingDetail,
   fetchMercadoLivreOrderDetail,
+  fetchMercadoLivrePackOrderIds,
   fetchMercadoLivrePaymentDetail,
   fetchMercadoLivreProductAdsAdvertisers,
   fetchMercadoLivreProductAdsMetrics,
@@ -45,6 +46,7 @@ import {
   refreshShopeeAccessToken,
   shopeeSignedShopRequest,
 } from "./marketplace-shopee.js";
+import type { MercadoLivreOrderSnapshot } from "./marketplace-ml.js";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const backendRoot = path.resolve(path.dirname(currentFilePath), "..");
@@ -523,6 +525,7 @@ const mercadoLivreCatalogVariationIgnoreSchema = z.object({
 
 const mercadoLivreOrdersSyncSchema = z.object({
   account_id: z.string().optional().or(z.literal("")),
+  order_id: z.string().optional().or(z.literal("")),
   mode: z.enum(["incremental", "light", "normal", "full"]).optional().default("normal"),
   limit: z.number().int().positive().max(50000).optional(),
   source: z.enum(["manual", "scheduler"]).optional().default("manual"),
@@ -3922,6 +3925,7 @@ app.post("/integrations/mercadolivre/sync/:runId/cancel", async (request, reply)
 app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
   const body = mercadoLivreOrdersSyncSchema.parse(request.body ?? {});
   const requestedAccountId = body.account_id?.trim() || undefined;
+  const requestedOrderId = body.order_id?.trim() || undefined;
   const account = resolveMercadoLivreAccount(requestedAccountId);
   const syncWindow = resolveMercadoLivreOrdersSyncWindow(body.mode, body.limit);
 
@@ -3954,6 +3958,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       "marketplace.sync.mode": syncWindow.mode,
       "marketplace.sync.window": syncWindow.label,
       "marketplace.sync.source": body.source,
+      "marketplace.sync.order_id": requestedOrderId ?? "",
       "marketplace.sync.date_created_from": syncWindow.dateCreatedFrom,
       "marketplace.sync.date_created_to": syncWindow.dateCreatedTo,
       "marketplace.sync.limit": syncWindow.limit,
@@ -3968,6 +3973,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
           sync_mode: syncWindow.mode,
           sync_window: syncWindow.label,
           sync_source: body.source,
+          order_id: requestedOrderId ?? null,
           date_created_from: syncWindow.dateCreatedFrom,
           date_created_to: syncWindow.dateCreatedTo,
         },
@@ -3990,6 +3996,31 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       throw new Error("Conta Mercado Livre sem access_token ativo.");
     }
     const accessToken = activeAccount.access_token;
+
+    let requestedOrderIds: string[] | null = null;
+    let requestedOrderPackId: string | null = null;
+    if (requestedOrderId) {
+      const initialDetail = await fetchMercadoLivreOrderDetail({
+        accessToken,
+        orderId: requestedOrderId,
+      }).catch(() => null);
+      requestedOrderPackId = initialDetail?.order.packId ?? null;
+      const packOrderIds =
+        requestedOrderPackId
+          ? await fetchMercadoLivrePackOrderIds({
+              accessToken,
+              packId: requestedOrderPackId,
+            }).catch(() => [])
+          : [];
+      requestedOrderIds = Array.from(new Set([requestedOrderId, ...packOrderIds]));
+      if (requestedOrderIds.length === 0) {
+        requestedOrderIds = [requestedOrderId];
+      }
+      span.setAttributes({
+        "marketplace.sync.requested_pack_id": requestedOrderPackId ?? "",
+        "marketplace.sync.requested_order_ids_count": requestedOrderIds.length,
+      });
+    }
 
     const upsertOrderStmt = db.prepare(
       `INSERT INTO marketplace_orders (
@@ -4061,14 +4092,25 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
     while (remaining > 0 && offset < totalKnown) {
       assertMarketplaceSyncNotCancelled(runId);
       const pageSize = Math.min(50, remaining);
-      const page = await fetchMercadoLivreSellerOrders({
-        accessToken,
-        sellerId: activeAccount.marketplace_user_id,
-        offset,
-        limit: pageSize,
-        dateCreatedFrom: syncWindow.dateCreatedFrom,
-        dateCreatedTo: syncWindow.dateCreatedTo,
-      });
+      const page = requestedOrderIds
+        ? {
+            orders: requestedOrderIds.map((orderId): MercadoLivreOrderSnapshot => ({
+              id: orderId,
+              sellerId: activeAccount.marketplace_user_id,
+              raw: { id: orderId },
+            })),
+            total: requestedOrderIds.length,
+            offset: 0,
+            limit: requestedOrderIds.length,
+          }
+        : await fetchMercadoLivreSellerOrders({
+            accessToken,
+            sellerId: activeAccount.marketplace_user_id,
+            offset,
+            limit: pageSize,
+            dateCreatedFrom: syncWindow.dateCreatedFrom,
+            dateCreatedTo: syncWindow.dateCreatedTo,
+          });
 
       totalKnown = Math.min(totalKnown, Math.max(0, page.total));
       if (!page.orders.length) break;
@@ -4078,7 +4120,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
         assertMarketplaceSyncNotCancelled(runId);
         recordsRead += 1;
         try {
-          if (syncWindow.stopAtFirstImported) {
+          if (syncWindow.stopAtFirstImported && !requestedOrderId) {
             const existingOrder = db
               .prepare(
                 `SELECT id
@@ -4193,16 +4235,21 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
             shippingCompensationCentsFromShipment > 0
               ? shippingCompensationCentsFromShipment
               : shippingCompensationCentsFromBilling;
+          const buyerShippingPaidCents = Math.max(
+            toPositiveCents(parsePriceToCents(shipmentCosts?.buyerShippingPaid)),
+            toPositiveCents(parsePriceToCents(billingDetail?.buyerShippingPaid))
+          );
 
-          const billedTotalCents =
+          const itemBilledTotalCents =
             parsePriceToCents(billingDetail?.billedTotal) ??
             parsePriceToCents(effectiveOrder.totalAmount);
-          const grossFallbackCents =
+          const billedTotalCents =
+            itemBilledTotalCents !== null ? itemBilledTotalCents + buyerShippingPaidCents : null;
+          const grossPaymentBaseCents =
             grossReceivedCents > 0
               ? grossReceivedCents
-              : parsePriceToCents(effectiveOrder.paidAmount) ??
-                parsePriceToCents(billingDetail?.billedTotal) ??
-                0;
+              : parsePriceToCents(effectiveOrder.paidAmount) ?? itemBilledTotalCents ?? 0;
+          const grossFallbackCents = grossPaymentBaseCents + buyerShippingPaidCents;
           const hasMlFeeSignals = Math.abs(mlFeeTotalCents) > 0;
           const hasOtherCostSignals =
             refundsTotalCents > 0 ||
@@ -4418,13 +4465,16 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       recordsRead,
       recordsUpserted,
       recordsFailed,
-      extraPayload: {
-        sync_mode: syncWindow.mode,
-        sync_window: syncWindow.label,
-        sync_source: body.source,
-        date_created_from: syncWindow.dateCreatedFrom,
-        date_created_to: syncWindow.dateCreatedTo,
-        stopped_at_existing_order: stoppedAtExistingOrder,
+        extraPayload: {
+          sync_mode: syncWindow.mode,
+          sync_window: syncWindow.label,
+          sync_source: body.source,
+          order_id: requestedOrderId ?? null,
+          resolved_order_ids: requestedOrderIds ?? null,
+          pack_id: requestedOrderPackId,
+          date_created_from: syncWindow.dateCreatedFrom,
+          date_created_to: syncWindow.dateCreatedTo,
+          stopped_at_existing_order: stoppedAtExistingOrder,
       },
     });
 
@@ -4437,6 +4487,9 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       records_upserted: recordsUpserted,
       records_failed: recordsFailed,
       stopped_at_existing_order: stoppedAtExistingOrder,
+      order_id: requestedOrderId ?? null,
+      resolved_order_ids: requestedOrderIds ?? null,
+      pack_id: requestedOrderPackId,
     };
   } catch (error: unknown) {
     rollbackSqlTransactionIfOpen();
@@ -5879,6 +5932,51 @@ app.post("/integrations/mercadolivre/orders/:id/recalculate-snapshots", async (r
     items_processed: result.itemsProcessed,
     items_updated: result.itemsUpdated,
     items_skipped: result.itemsSkipped,
+  };
+});
+
+app.post("/integrations/mercadolivre/orders/:id/refresh", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const order = db
+    .prepare(
+      `SELECT id, account_id, marketplace_order_id
+       FROM marketplace_orders
+       WHERE id = ?
+         AND marketplace = 'mercadolivre'`
+    )
+    .get(id) as
+    | {
+        id: string;
+        account_id: string;
+        marketplace_order_id: string;
+      }
+    | undefined;
+
+  if (!order) {
+    reply.code(404);
+    return { message: "Pedido Mercado Livre não encontrado." };
+  }
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/integrations/mercadolivre/sync/orders",
+    payload: JSON.stringify({
+      account_id: order.account_id,
+      order_id: order.marketplace_order_id,
+      mode: "normal",
+      source: "manual",
+    }),
+    headers: {
+      "content-type": "application/json",
+    },
+  });
+
+  const payload = response.json<any>();
+  reply.code(response.statusCode);
+  return {
+    ...payload,
+    order_id: order.id,
+    marketplace_order_id: order.marketplace_order_id,
   };
 });
 
