@@ -5,6 +5,7 @@ import { stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import cors from "@fastify/cors";
 import multipart from "@fastify/multipart";
+import { SpanStatusCode } from "@opentelemetry/api";
 import Fastify from "fastify";
 import { v4 as uuidv4 } from "uuid";
 import { ZodError, z } from "zod";
@@ -24,6 +25,8 @@ import {
   fetchMercadoLivreOrderBillingDetail,
   fetchMercadoLivreOrderDetail,
   fetchMercadoLivrePaymentDetail,
+  fetchMercadoLivreProductAdsAdvertisers,
+  fetchMercadoLivreProductAdsMetrics,
   fetchMercadoLivreSellerOrders,
   fetchMercadoLivreSellerItemIds,
   fetchMercadoLivreShipmentCosts,
@@ -127,8 +130,154 @@ function ensureMarketplaceCatalogItemColumns() {
   ).run();
 }
 
+function ensureSalesSkuPriceColumns() {
+  const columns = db
+    .prepare("PRAGMA table_info('sales_skus')")
+    .all() as Array<{ name?: string }>;
+  const names = new Set(columns.map((column) => String(column.name ?? "")));
+
+  if (!names.has("presential_sale_price_cents")) {
+    db.prepare(
+      "ALTER TABLE sales_skus ADD COLUMN presential_sale_price_cents INTEGER NOT NULL DEFAULT 0 CHECK (presential_sale_price_cents >= 0)"
+    ).run();
+  }
+  if (!names.has("wholesale_consignment_price_cents")) {
+    db.prepare(
+      "ALTER TABLE sales_skus ADD COLUMN wholesale_consignment_price_cents INTEGER NOT NULL DEFAULT 0 CHECK (wholesale_consignment_price_cents >= 0)"
+    ).run();
+  }
+  if (!names.has("wholesale_cash_price_cents")) {
+    db.prepare(
+      "ALTER TABLE sales_skus ADD COLUMN wholesale_cash_price_cents INTEGER NOT NULL DEFAULT 0 CHECK (wholesale_cash_price_cents >= 0)"
+    ).run();
+  }
+  if (!names.has("sync_final_sale_price_with_suggested")) {
+    db.prepare(
+      "ALTER TABLE sales_skus ADD COLUMN sync_final_sale_price_with_suggested INTEGER NOT NULL DEFAULT 1 CHECK (sync_final_sale_price_with_suggested IN (0,1))"
+    ).run();
+  }
+  if (!names.has("sync_presential_sale_price_with_suggested")) {
+    db.prepare(
+      "ALTER TABLE sales_skus ADD COLUMN sync_presential_sale_price_with_suggested INTEGER NOT NULL DEFAULT 1 CHECK (sync_presential_sale_price_with_suggested IN (0,1))"
+    ).run();
+  }
+  if (!names.has("sync_wholesale_consignment_price_with_suggested")) {
+    db.prepare(
+      "ALTER TABLE sales_skus ADD COLUMN sync_wholesale_consignment_price_with_suggested INTEGER NOT NULL DEFAULT 1 CHECK (sync_wholesale_consignment_price_with_suggested IN (0,1))"
+    ).run();
+  }
+  if (!names.has("sync_wholesale_cash_price_with_suggested")) {
+    db.prepare(
+      "ALTER TABLE sales_skus ADD COLUMN sync_wholesale_cash_price_with_suggested INTEGER NOT NULL DEFAULT 1 CHECK (sync_wholesale_cash_price_with_suggested IN (0,1))"
+    ).run();
+  }
+
+  db.prepare(
+    `UPDATE sales_skus
+     SET default_sale_price_cents = CASE
+           WHEN sync_final_sale_price_with_suggested = 1
+             AND suggested_final_price_cents IS NOT NULL
+             AND suggested_final_price_cents > 0
+           THEN suggested_final_price_cents
+           ELSE default_sale_price_cents
+         END,
+         presential_sale_price_cents = CASE
+           WHEN presential_sale_price_cents = 0
+             AND suggested_presential_price_cents IS NOT NULL
+             AND suggested_presential_price_cents > 0
+           THEN suggested_presential_price_cents
+           WHEN presential_sale_price_cents = 0 THEN default_sale_price_cents
+           ELSE presential_sale_price_cents
+         END,
+         wholesale_consignment_price_cents = CASE
+           WHEN wholesale_consignment_price_cents = 0
+             AND suggested_wholesale_consignment_price_cents IS NOT NULL
+           THEN suggested_wholesale_consignment_price_cents
+           ELSE wholesale_consignment_price_cents
+         END,
+         wholesale_cash_price_cents = CASE
+           WHEN wholesale_cash_price_cents = 0
+             AND suggested_wholesale_cash_price_cents IS NOT NULL
+           THEN suggested_wholesale_cash_price_cents
+           ELSE wholesale_cash_price_cents
+         END`
+  ).run();
+}
+
+function ensureMarketplaceProductAdsMetricsTable() {
+  db.prepare(
+    `CREATE TABLE IF NOT EXISTS marketplace_product_ads_daily_metrics (
+      id TEXT PRIMARY KEY,
+      marketplace TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      advertiser_id TEXT NOT NULL,
+      site_id TEXT NOT NULL,
+      metric_date TEXT NOT NULL,
+      cost_cents INTEGER NOT NULL DEFAULT 0,
+      impressions INTEGER NOT NULL DEFAULT 0,
+      clicks INTEGER NOT NULL DEFAULT 0,
+      ads_orders INTEGER NOT NULL DEFAULT 0,
+      ads_revenue_cents INTEGER NOT NULL DEFAULT 0,
+      raw_json TEXT,
+      last_synced_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (marketplace, account_id, advertiser_id, site_id, metric_date),
+      FOREIGN KEY (account_id) REFERENCES marketplace_accounts(id) ON DELETE CASCADE
+    )`
+  ).run();
+
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_product_ads_metrics_account_date
+      ON marketplace_product_ads_daily_metrics (marketplace, account_id, metric_date)`
+  ).run();
+
+  db.prepare(
+    `CREATE TABLE IF NOT EXISTS marketplace_product_ads_metric_snapshots (
+      id TEXT PRIMARY KEY,
+      marketplace TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      run_id TEXT,
+      advertiser_id TEXT NOT NULL,
+      site_id TEXT NOT NULL,
+      metric_date TEXT NOT NULL,
+      sync_mode TEXT NOT NULL,
+      sync_source TEXT NOT NULL,
+      cost_cents INTEGER NOT NULL DEFAULT 0,
+      impressions INTEGER NOT NULL DEFAULT 0,
+      clicks INTEGER NOT NULL DEFAULT 0,
+      ads_orders INTEGER NOT NULL DEFAULT 0,
+      ads_revenue_cents INTEGER NOT NULL DEFAULT 0,
+      previous_snapshot_id TEXT,
+      delta_cost_cents INTEGER NOT NULL DEFAULT 0,
+      delta_impressions INTEGER NOT NULL DEFAULT 0,
+      delta_clicks INTEGER NOT NULL DEFAULT 0,
+      delta_ads_orders INTEGER NOT NULL DEFAULT 0,
+      delta_ads_revenue_cents INTEGER NOT NULL DEFAULT 0,
+      raw_json TEXT,
+      fetched_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (account_id) REFERENCES marketplace_accounts(id) ON DELETE CASCADE,
+      FOREIGN KEY (run_id) REFERENCES marketplace_sync_runs(id) ON DELETE SET NULL,
+      FOREIGN KEY (previous_snapshot_id) REFERENCES marketplace_product_ads_metric_snapshots(id) ON DELETE SET NULL
+    )`
+  ).run();
+
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_product_ads_snapshots_account_date
+      ON marketplace_product_ads_metric_snapshots (marketplace, account_id, metric_date, fetched_at DESC)`
+  ).run();
+
+  db.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_product_ads_snapshots_run
+      ON marketplace_product_ads_metric_snapshots (run_id)`
+  ).run();
+}
+
 ensureMarketplaceCatalogItemColumns();
 ensureMarketplaceCatalogVariationColumns();
+ensureSalesSkuPriceColumns();
+ensureMarketplaceProductAdsMetricsTable();
 ensureMediaStorage(mediaRoot);
 
 const app = Fastify({ logger: true });
@@ -233,6 +382,13 @@ const salesSkuSchema = z.object({
   name: z.string().optional().default(""),
   description: z.string().optional().default(""),
   default_sale_price_cents: z.number().int().nonnegative().optional(),
+  presential_sale_price_cents: z.number().int().nonnegative().optional(),
+  wholesale_consignment_price_cents: z.number().int().nonnegative().optional(),
+  wholesale_cash_price_cents: z.number().int().nonnegative().optional(),
+  sync_final_sale_price_with_suggested: z.boolean().optional(),
+  sync_presential_sale_price_with_suggested: z.boolean().optional(),
+  sync_wholesale_consignment_price_with_suggested: z.boolean().optional(),
+  sync_wholesale_cash_price_with_suggested: z.boolean().optional(),
   production_cost_cents: z.number().int().nonnegative().optional(),
   suggested_wholesale_consignment_price_cents: z.number().int().nonnegative().optional(),
   suggested_wholesale_cash_price_cents: z.number().int().nonnegative().optional(),
@@ -303,6 +459,27 @@ const consignmentReturnSchema = z.object({
   notes: z.string().optional().default(""),
 });
 
+const consignmentPointSaleSchema = z.object({
+  sku_id: z.string().min(1),
+  sold_quantity: z.number().int().positive(),
+  sold_at: z.string().optional().or(z.literal("")),
+  notes: z.string().optional().default(""),
+});
+
+const consignmentPointReturnSchema = z.object({
+  sku_id: z.string().min(1),
+  returned_quantity: z.number().int().positive(),
+  returned_at: z.string().optional().or(z.literal("")),
+  notes: z.string().optional().default(""),
+});
+
+const consignmentDashboardQuerySchema = z.object({
+  date_from: z.string().optional().or(z.literal("")),
+  date_to: z.string().optional().or(z.literal("")),
+  sales_point_id: z.string().optional().or(z.literal("")),
+  limit: z.coerce.number().int().positive().max(500).optional().default(100),
+});
+
 const mercadoLivreConnectSchema = z.object({
   account_label: z.string().optional().default(""),
 });
@@ -348,6 +525,13 @@ const mercadoLivreOrdersSyncSchema = z.object({
   account_id: z.string().optional().or(z.literal("")),
   mode: z.enum(["incremental", "light", "normal", "full"]).optional().default("normal"),
   limit: z.number().int().positive().max(50000).optional(),
+  source: z.enum(["manual", "scheduler"]).optional().default("manual"),
+});
+
+const mercadoLivreProductAdsSyncSchema = z.object({
+  account_id: z.string().optional().or(z.literal("")),
+  mode: z.enum(["incremental", "light", "normal", "full"]).optional().default("incremental"),
+  source: z.enum(["manual", "scheduler"]).optional().default("manual"),
 });
 
 const mercadoLivreOrdersListQuerySchema = z.object({
@@ -359,6 +543,8 @@ const mercadoLivreOrdersListQuerySchema = z.object({
 
 const mercadoLivreOrdersDashboardQuerySchema = z.object({
   account_id: z.string().optional().or(z.literal("")),
+  date_from: z.string().optional().or(z.literal("")),
+  date_to: z.string().optional().or(z.literal("")),
 });
 
 const mercadoLivreOrdersRecalculateSnapshotsSchema = z.object({
@@ -453,6 +639,35 @@ function getBatchItemCounters(batchItemId: string): {
     returned_quantity: row.returned_quantity,
     remaining_quantity: row.quantity_sent - row.sold_quantity - row.returned_quantity,
   };
+}
+
+function getOpenConsignmentBatchItemsForPointSku(salesPointId: string, skuId: string) {
+  return db
+    .prepare(
+      `SELECT cbi.id,
+              cbi.sku_id,
+              cb.id AS batch_id,
+              cb.sales_point_id,
+              cbi.quantity_sent,
+              COALESCE((SELECT SUM(sold_quantity) FROM consignment_sales cs WHERE cs.batch_item_id = cbi.id), 0) AS sold_quantity,
+              COALESCE((SELECT SUM(returned_quantity) FROM consignment_returns cr WHERE cr.batch_item_id = cbi.id), 0) AS returned_quantity
+       FROM consignment_batch_items cbi
+       JOIN consignment_batches cb ON cb.id = cbi.batch_id
+       WHERE cb.sales_point_id = ?
+         AND cbi.sku_id = ?
+         AND cb.status = 'open'
+       ORDER BY cb.dispatched_at ASC, cbi.created_at ASC`
+    )
+    .all(salesPointId, skuId)
+    .map((row: any) => ({
+      id: String(row.id),
+      sku_id: String(row.sku_id),
+      batch_id: String(row.batch_id),
+      sales_point_id: String(row.sales_point_id),
+      remaining_quantity:
+        Number(row.quantity_sent ?? 0) - Number(row.sold_quantity ?? 0) - Number(row.returned_quantity ?? 0),
+    }))
+    .filter((row) => row.remaining_quantity > 0);
 }
 
 function generateInternalSkuCode(): string {
@@ -1494,7 +1709,10 @@ function syncSkusLinkedToQuote(quoteId: string): number {
   const result = db
     .prepare(
       `UPDATE sales_skus
-       SET default_sale_price_cents = ?,
+       SET default_sale_price_cents = CASE WHEN sync_final_sale_price_with_suggested = 1 THEN ? ELSE default_sale_price_cents END,
+           presential_sale_price_cents = CASE WHEN sync_presential_sale_price_with_suggested = 1 THEN ? ELSE presential_sale_price_cents END,
+           wholesale_consignment_price_cents = CASE WHEN sync_wholesale_consignment_price_with_suggested = 1 THEN ? ELSE wholesale_consignment_price_cents END,
+           wholesale_cash_price_cents = CASE WHEN sync_wholesale_cash_price_with_suggested = 1 THEN ? ELSE wholesale_cash_price_cents END,
            production_cost_cents = ?,
            suggested_final_price_cents = ?,
            suggested_presential_price_cents = ?,
@@ -1506,7 +1724,10 @@ function syncSkusLinkedToQuote(quoteId: string): number {
          AND source_quote_id = ?`
     )
     .run(
-      recomputed.finalUnitCents,
+      suggested.suggested_final_price_cents,
+      suggested.suggested_presential_price_cents,
+      suggested.suggested_wholesale_consignment_price_cents,
+      suggested.suggested_wholesale_cash_price_cents,
       recomputed.subtotalUnitCents,
       suggested.suggested_final_price_cents,
       suggested.suggested_presential_price_cents,
@@ -1746,6 +1967,7 @@ type MarketplaceAccountRow = {
   updated_at: string;
   last_connected_at: string;
   last_token_refresh_at: string | null;
+  metadata_json?: string | null;
 };
 
 function toMarketplaceAccountResponse(account: MarketplaceAccountRow) {
@@ -2252,6 +2474,15 @@ function resolveShopeeAccount(accountId?: string | null): MarketplaceAccountRow 
 function parsePriceToCents(value: number | undefined): number | null {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
   return Math.round(value * 100);
+}
+
+function normalizeDateFilterBoundary(value: string | null, boundary: "start" | "end"): string | null {
+  const trimmed = value?.trim() ?? "";
+  if (!trimmed) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return boundary === "start" ? `${trimmed}T00:00:00.000Z` : `${trimmed}T23:59:59.999Z`;
+  }
+  return trimmed;
 }
 
 function parseSignedPriceToCents(value: number | undefined): number | null {
@@ -3722,6 +3953,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       "marketplace.sync.type": "orders_read",
       "marketplace.sync.mode": syncWindow.mode,
       "marketplace.sync.window": syncWindow.label,
+      "marketplace.sync.source": body.source,
       "marketplace.sync.date_created_from": syncWindow.dateCreatedFrom,
       "marketplace.sync.date_created_to": syncWindow.dateCreatedTo,
       "marketplace.sync.limit": syncWindow.limit,
@@ -3735,6 +3967,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
         extraPayload: {
           sync_mode: syncWindow.mode,
           sync_window: syncWindow.label,
+          sync_source: body.source,
           date_created_from: syncWindow.dateCreatedFrom,
           date_created_to: syncWindow.dateCreatedTo,
         },
@@ -4188,6 +4421,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       extraPayload: {
         sync_mode: syncWindow.mode,
         sync_window: syncWindow.label,
+        sync_source: body.source,
         date_created_from: syncWindow.dateCreatedFrom,
         date_created_to: syncWindow.dateCreatedTo,
         stopped_at_existing_order: stoppedAtExistingOrder,
@@ -4243,6 +4477,7 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
       extraPayload: {
         sync_mode: syncWindow.mode,
         sync_window: syncWindow.label,
+        sync_source: body.source,
         date_created_from: syncWindow.dateCreatedFrom,
         date_created_to: syncWindow.dateCreatedTo,
       },
@@ -4295,6 +4530,512 @@ app.post("/integrations/mercadolivre/sync/orders", async (request, reply) => {
   ).finally(() => {
     marketplaceOrdersSyncRunningAccounts.delete(account.id);
   });
+});
+
+app.post("/integrations/mercadolivre/sync/product-ads", async (request, reply) => {
+  const body = mercadoLivreProductAdsSyncSchema.parse(request.body ?? {});
+  const requestedAccountId = body.account_id?.trim() || undefined;
+  const syncWindow = resolveMercadoLivreProductAdsSyncWindow(body.mode);
+  const accountRows = requestedAccountId
+    ? [resolveMercadoLivreAccount(requestedAccountId)].filter(Boolean)
+    : (db
+        .prepare(
+          `SELECT id, marketplace, account_label, marketplace_user_id, seller_nickname, country_id,
+                  access_token, refresh_token, token_expires_at, scope, is_active, created_at, updated_at,
+                  last_connected_at, last_token_refresh_at, metadata_json
+           FROM marketplace_accounts
+           WHERE marketplace = 'mercadolivre'
+             AND is_active = 1`
+        )
+        .all() as MarketplaceAccountRow[]);
+
+  if (accountRows.length === 0) {
+    reply.code(404);
+    return { message: "Conta Mercado Livre ativa não encontrada." };
+  }
+
+  const runId = uuidv4();
+  const startedAt = nowIso();
+  const accountRunIds = new Map<string, string>();
+  const insertProductAdsRunStmt = db.prepare(
+    `INSERT INTO marketplace_sync_runs (
+      id, marketplace, account_id, sync_type, status, started_at, finished_at,
+      records_read, records_upserted, records_failed, error_message, created_at, updated_at
+    ) VALUES (?, 'mercadolivre', ?, 'product_ads_read', 'running', ?, NULL, 0, 0, 0, NULL, ?, ?)`
+  );
+  for (const account of accountRows) {
+    if (!account) continue;
+    const accountRunId = accountRows.length === 1 ? runId : uuidv4();
+    accountRunIds.set(account.id, accountRunId);
+    insertProductAdsRunStmt.run(accountRunId, account.id, startedAt, startedAt, startedAt);
+  }
+  let recordsRead = 0;
+  let recordsUpserted = 0;
+  let recordsFailed = 0;
+
+  return runWithSpan(
+    "mercadolivre.sync.product_ads",
+    {
+      "marketplace.name": "mercadolivre",
+      "marketplace.sync.run_id": runId,
+      "marketplace.sync.type": "product_ads_read",
+      "marketplace.sync.mode": body.mode,
+      "marketplace.sync.source": body.source,
+      "marketplace.sync.date_from": syncWindow.dateFrom,
+      "marketplace.sync.date_to": syncWindow.dateTo,
+    },
+    async (span) => {
+      const traceContext = activeTraceContext();
+      span.addEvent("product_ads.sync.started", {
+        "marketplace.sync.accounts_count": accountRows.length,
+        "marketplace.sync.started_at": startedAt,
+      });
+      appendOperationLog({
+        eventType: "marketplace_product_ads_read_started",
+        entityType: "marketplace_sync_run",
+        entityId: runId,
+        summary: "Sincronização de Product Ads Mercado Livre iniciada",
+        payload: {
+          marketplace: "mercadolivre",
+          run_id: runId,
+          sync_type: "product_ads_read",
+          sync_mode: body.mode,
+          sync_window: syncWindow.label,
+          sync_source: body.source,
+          date_from: syncWindow.dateFrom,
+          date_to: syncWindow.dateTo,
+          phase: "started",
+          trace_id: traceContext.traceId ?? null,
+          span_id: traceContext.spanId ?? null,
+        },
+      });
+
+      const upsertStmt = db.prepare(
+        `INSERT INTO marketplace_product_ads_daily_metrics (
+          id, marketplace, account_id, advertiser_id, site_id, metric_date,
+          cost_cents, impressions, clicks, ads_orders, ads_revenue_cents,
+          raw_json, last_synced_at, created_at, updated_at
+        ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(marketplace, account_id, advertiser_id, site_id, metric_date) DO UPDATE SET
+          cost_cents = excluded.cost_cents,
+          impressions = excluded.impressions,
+          clicks = excluded.clicks,
+          ads_orders = excluded.ads_orders,
+          ads_revenue_cents = excluded.ads_revenue_cents,
+          raw_json = excluded.raw_json,
+          last_synced_at = excluded.last_synced_at,
+          updated_at = excluded.updated_at`
+      );
+      const lastSnapshotStmt = db.prepare(
+        `SELECT id, cost_cents, impressions, clicks, ads_orders, ads_revenue_cents
+         FROM marketplace_product_ads_metric_snapshots
+         WHERE marketplace = 'mercadolivre'
+           AND account_id = ?
+           AND advertiser_id = ?
+           AND site_id = ?
+           AND metric_date = ?
+         ORDER BY fetched_at DESC, created_at DESC
+         LIMIT 1`
+      );
+      const insertSnapshotStmt = db.prepare(
+        `INSERT INTO marketplace_product_ads_metric_snapshots (
+          id, marketplace, account_id, run_id, advertiser_id, site_id, metric_date,
+          sync_mode, sync_source, cost_cents, impressions, clicks, ads_orders, ads_revenue_cents,
+          previous_snapshot_id, delta_cost_cents, delta_impressions, delta_clicks,
+          delta_ads_orders, delta_ads_revenue_cents, raw_json, fetched_at, created_at
+        ) VALUES (?, 'mercadolivre', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      const updateRunStmt = db.prepare(
+        `UPDATE marketplace_sync_runs
+         SET status = ?,
+             finished_at = ?,
+             records_read = ?,
+             records_upserted = ?,
+             records_failed = ?,
+             error_message = ?,
+             updated_at = ?
+         WHERE id = ?`
+      );
+
+      try {
+        for (const rawAccount of accountRows) {
+          if (!rawAccount) continue;
+          let account = rawAccount;
+          const accountRunId = accountRunIds.get(rawAccount.id) ?? runId;
+          let accountRecordsRead = 0;
+          let accountRecordsUpserted = 0;
+          let accountRecordsFailed = 0;
+          try {
+            span.addEvent("product_ads.account.started", {
+              "marketplace.account_id": rawAccount.id,
+              "marketplace.sync.run_id": accountRunId,
+            });
+            if (isTokenExpiringSoon(account.token_expires_at, 180)) {
+              const refreshed = await refreshMercadoLivreAccountToken(account.id);
+              if (refreshed) account = refreshed;
+            }
+            if (!account.access_token) {
+              recordsFailed += 1;
+              accountRecordsFailed += 1;
+              const finishedAt = nowIso();
+              updateRunStmt.run(
+                "error",
+                finishedAt,
+                accountRecordsRead,
+                accountRecordsUpserted,
+                accountRecordsFailed,
+                "Conta sem access token",
+                finishedAt,
+                accountRunId
+              );
+              span.addEvent("product_ads.account.unavailable", {
+                "marketplace.account_id": account.id,
+                "marketplace.sync.run_id": accountRunId,
+                "marketplace.product_ads.unavailable_reason": "missing_access_token",
+              });
+              appendOperationLog({
+                eventType: "marketplace_product_ads_read_failed",
+                entityType: "marketplace_account",
+                entityId: account.id,
+                summary: "Product Ads Mercado Livre indisponível: conta sem access token",
+                payload: {
+                  marketplace: "mercadolivre",
+                  run_id: runId,
+                  account_run_id: accountRunId,
+                  account_id: account.id,
+                  sync_type: "product_ads_read",
+                  sync_mode: body.mode,
+                  sync_source: body.source,
+                  phase: "account_unavailable",
+                  reason: "missing_access_token",
+                  trace_id: traceContext.traceId ?? null,
+                  span_id: traceContext.spanId ?? null,
+                },
+              });
+              continue;
+            }
+
+            const siteId = getMarketplaceAccountSiteId(account);
+            const advertisers = await fetchMercadoLivreProductAdsAdvertisers({
+              accessToken: account.access_token,
+              siteId,
+            });
+            const advertiser = advertisers[0];
+            const resolvedSiteId = advertiser?.siteId ?? siteId;
+            if (!advertiser || !resolvedSiteId) {
+              recordsFailed += 1;
+              accountRecordsFailed += 1;
+              const finishedAt = nowIso();
+              updateRunStmt.run(
+                "error",
+                finishedAt,
+                accountRecordsRead,
+                accountRecordsUpserted,
+                accountRecordsFailed,
+                "Advertiser ou site de Product Ads não encontrado",
+                finishedAt,
+                accountRunId
+              );
+              span.addEvent("product_ads.account.unavailable", {
+                "marketplace.account_id": account.id,
+                "marketplace.sync.run_id": accountRunId,
+                "marketplace.product_ads.unavailable_reason": "missing_advertiser_or_site",
+              });
+              appendOperationLog({
+                eventType: "marketplace_product_ads_read_failed",
+                entityType: "marketplace_account",
+                entityId: account.id,
+                summary: "Product Ads Mercado Livre indisponível para a conta",
+                payload: {
+                  marketplace: "mercadolivre",
+                  run_id: runId,
+                  account_run_id: accountRunId,
+                  account_id: account.id,
+                  sync_type: "product_ads_read",
+                  sync_mode: body.mode,
+                  sync_source: body.source,
+                  phase: "account_unavailable",
+                  reason: "missing_advertiser_or_site",
+                  site_id: siteId,
+                  trace_id: traceContext.traceId ?? null,
+                  span_id: traceContext.spanId ?? null,
+                },
+              });
+              continue;
+            }
+
+            const now = nowIso();
+            let accountCostCents = 0;
+            let accountImpressions = 0;
+            let accountClicks = 0;
+            const syncDays = enumerateIsoDateRange(syncWindow.dateFrom, syncWindow.dateTo);
+            for (const syncDay of syncDays) {
+              const result = await fetchMercadoLivreProductAdsMetrics({
+                accessToken: account.access_token,
+                siteId: resolvedSiteId,
+                advertiserId: advertiser.advertiserId,
+                dateFrom: syncDay,
+                dateTo: syncDay,
+              });
+
+              for (const metric of result.metrics) {
+                const costCents = Math.max(0, Math.round(metric.cost * 100));
+                const impressions = Math.max(0, Math.round(metric.impressions));
+                const clicks = Math.max(0, Math.round(metric.clicks));
+                const adsOrders = Math.max(0, Math.round(metric.orders));
+                const adsRevenueCents = Math.max(0, Math.round(metric.revenue * 100));
+                const rawJson = JSON.stringify(metric);
+                recordsRead += 1;
+                accountRecordsRead += 1;
+                upsertStmt.run(
+                  uuidv4(),
+                  account.id,
+                  advertiser.advertiserId,
+                  resolvedSiteId,
+                  metric.date,
+                  costCents,
+                  impressions,
+                  clicks,
+                  adsOrders,
+                  adsRevenueCents,
+                  rawJson,
+                  now,
+                  now,
+                  now
+                );
+                const previousSnapshot = lastSnapshotStmt.get(
+                  account.id,
+                  advertiser.advertiserId,
+                  resolvedSiteId,
+                  metric.date
+                ) as
+                  | {
+                      id: string;
+                      cost_cents: number;
+                      impressions: number;
+                      clicks: number;
+                      ads_orders: number;
+                      ads_revenue_cents: number;
+                    }
+                  | undefined;
+                insertSnapshotStmt.run(
+                  uuidv4(),
+                  account.id,
+                  accountRunId,
+                  advertiser.advertiserId,
+                  resolvedSiteId,
+                  metric.date,
+                  body.mode,
+                  body.source,
+                  costCents,
+                  impressions,
+                  clicks,
+                  adsOrders,
+                  adsRevenueCents,
+                  previousSnapshot?.id ?? null,
+                  Math.max(0, costCents - (previousSnapshot?.cost_cents ?? 0)),
+                  Math.max(0, impressions - (previousSnapshot?.impressions ?? 0)),
+                  Math.max(0, clicks - (previousSnapshot?.clicks ?? 0)),
+                  Math.max(0, adsOrders - (previousSnapshot?.ads_orders ?? 0)),
+                  Math.max(0, adsRevenueCents - (previousSnapshot?.ads_revenue_cents ?? 0)),
+                  rawJson,
+                  now,
+                  now
+                );
+                accountCostCents += costCents;
+                accountImpressions += impressions;
+                accountClicks += clicks;
+                recordsUpserted += 1;
+                accountRecordsUpserted += 1;
+              }
+            }
+            const finishedAt = nowIso();
+            updateRunStmt.run(
+              "success",
+              finishedAt,
+              accountRecordsRead,
+              accountRecordsUpserted,
+              accountRecordsFailed,
+              null,
+              finishedAt,
+              accountRunId
+            );
+            span.addEvent("product_ads.account.finished", {
+              "marketplace.account_id": account.id,
+              "marketplace.sync.run_id": accountRunId,
+              "marketplace.product_ads.advertiser_id": advertiser.advertiserId,
+              "marketplace.product_ads.site_id": resolvedSiteId,
+              "marketplace.product_ads.records_read": accountRecordsRead,
+              "marketplace.product_ads.days_requested": syncDays.length,
+              "marketplace.product_ads.cost_cents": accountCostCents,
+              "marketplace.product_ads.impressions": accountImpressions,
+              "marketplace.product_ads.clicks": accountClicks,
+            });
+          } catch (error: any) {
+            recordsFailed += 1;
+            accountRecordsFailed += 1;
+            const finishedAt = nowIso();
+            const accountErrorMessage =
+              error instanceof MercadoLivreApiError
+                ? `Mercado Livre API error (${error.statusCode}): ${error.message}`
+                : String(error?.message ?? "Failed to sync Product Ads");
+            const accountErrorDetails =
+              error instanceof MercadoLivreApiError
+                ? {
+                    status: error.statusCode,
+                    details: error.details,
+                  }
+                : null;
+            updateRunStmt.run(
+              "error",
+              finishedAt,
+              accountRecordsRead,
+              accountRecordsUpserted,
+              accountRecordsFailed,
+              accountErrorMessage,
+              finishedAt,
+              accountRunId
+            );
+            span.recordException(error as Error);
+            span.addEvent("product_ads.account.failed", {
+              "marketplace.account_id": rawAccount.id,
+              "marketplace.sync.run_id": accountRunId,
+              "marketplace.product_ads.error": String(error?.message ?? error),
+              "marketplace.product_ads.error_status": error instanceof MercadoLivreApiError ? error.statusCode : undefined,
+            });
+            db.prepare(
+              `INSERT INTO marketplace_sync_errors (
+                id, run_id, account_id, marketplace, error_code, error_message, payload_json, created_at
+              ) VALUES (?, ?, ?, 'mercadolivre', ?, ?, ?, ?)`
+            ).run(
+              uuidv4(),
+              accountRunId,
+              rawAccount.id,
+              "product_ads_sync_failed",
+              accountErrorMessage,
+              JSON.stringify({
+                account_id: rawAccount.id,
+                mode: body.mode,
+                source: body.source,
+                error: accountErrorDetails,
+              }),
+              nowIso()
+            );
+            appendOperationLog({
+              eventType: "marketplace_product_ads_read_failed",
+              entityType: "marketplace_account",
+              entityId: rawAccount.id,
+              summary: "Falha parcial ao sincronizar Product Ads Mercado Livre",
+              payload: {
+                marketplace: "mercadolivre",
+                run_id: runId,
+                account_run_id: accountRunId,
+                account_id: rawAccount.id,
+                sync_type: "product_ads_read",
+                sync_mode: body.mode,
+                sync_source: body.source,
+                phase: "account_failed",
+                message: accountErrorMessage,
+                error_status: accountErrorDetails?.status ?? null,
+                error_details: accountErrorDetails?.details ?? null,
+                trace_id: traceContext.traceId ?? null,
+                span_id: traceContext.spanId ?? null,
+              },
+            });
+          }
+        }
+
+        span.setAttributes({
+          "marketplace.sync.records_read": recordsRead,
+          "marketplace.sync.records_upserted": recordsUpserted,
+          "marketplace.sync.records_failed": recordsFailed,
+          "marketplace.sync.accounts_count": accountRows.length,
+        });
+        span.addEvent("product_ads.sync.finished", {
+          "marketplace.sync.records_read": recordsRead,
+          "marketplace.sync.records_upserted": recordsUpserted,
+          "marketplace.sync.records_failed": recordsFailed,
+        });
+        const syncFailed = recordsFailed > 0 && recordsRead === 0 && recordsUpserted === 0;
+        const finalSummary = syncFailed
+          ? "Sincronização de Product Ads Mercado Livre falhou"
+          : recordsFailed > 0
+            ? "Sincronização de Product Ads Mercado Livre concluída com falhas"
+            : "Sincronização de Product Ads Mercado Livre concluída";
+        if (syncFailed) {
+          span.setStatus({ code: SpanStatusCode.ERROR, message: finalSummary });
+        }
+        appendOperationLog({
+          eventType: syncFailed ? "marketplace_product_ads_read_failed" : "marketplace_product_ads_read_finished",
+          entityType: "marketplace_sync_run",
+          entityId: runId,
+          summary: finalSummary,
+          payload: {
+            marketplace: "mercadolivre",
+            run_id: runId,
+            sync_type: "product_ads_read",
+            sync_mode: body.mode,
+            sync_window: syncWindow.label,
+            sync_source: body.source,
+            date_from: syncWindow.dateFrom,
+            date_to: syncWindow.dateTo,
+            phase: syncFailed ? "error" : "finished",
+            records_read: recordsRead,
+            records_upserted: recordsUpserted,
+            records_failed: recordsFailed,
+            trace_id: traceContext.traceId ?? null,
+            span_id: traceContext.spanId ?? null,
+          },
+        });
+
+        if (syncFailed) {
+          reply.code(502);
+        }
+        return {
+          ok: !syncFailed,
+          message: syncFailed ? finalSummary : undefined,
+          run_id: runId,
+          account_run_ids: Object.fromEntries(accountRunIds),
+          marketplace: "mercadolivre",
+          records_read: recordsRead,
+          records_upserted: recordsUpserted,
+          records_failed: recordsFailed,
+        };
+      } catch (error: any) {
+        const message = error?.message ?? "Falha ao sincronizar Product Ads";
+        const finishedAt = nowIso();
+        for (const accountRunId of accountRunIds.values()) {
+          updateRunStmt.run("error", finishedAt, 0, 0, 1, message, finishedAt, accountRunId);
+        }
+        span.recordException(error as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message });
+        span.setAttributes({
+          "marketplace.sync.records_read": recordsRead,
+          "marketplace.sync.records_upserted": recordsUpserted,
+          "marketplace.sync.records_failed": recordsFailed,
+        });
+        appendOperationLog({
+          eventType: "marketplace_product_ads_read_failed",
+          entityType: "marketplace_sync_run",
+          entityId: runId,
+          summary: "Sincronização de Product Ads Mercado Livre falhou",
+          payload: {
+            marketplace: "mercadolivre",
+            run_id: runId,
+            sync_type: "product_ads_read",
+            sync_mode: body.mode,
+            sync_source: body.source,
+            phase: "error",
+            message,
+            trace_id: traceContext.traceId ?? null,
+            span_id: traceContext.spanId ?? null,
+          },
+        });
+        reply.code(500);
+        return { message, run_id: runId, records_read: recordsRead, records_upserted: recordsUpserted, records_failed: recordsFailed };
+      }
+    }
+  );
 });
 
 function loadMarketplaceOrderItemsWithCost(orderId: string) {
@@ -4606,9 +5347,144 @@ type MarketplaceOrdersDashboardRow = {
   seller_nickname: string | null;
 };
 
+function getMarketplaceAccountSiteId(account: MarketplaceAccountRow): string | null {
+  try {
+    const metadata = account.metadata_json ? JSON.parse(account.metadata_json) : null;
+    const siteId = metadata?.site_id ? String(metadata.site_id).trim() : "";
+    if (siteId) return siteId;
+  } catch {
+    // Ignore invalid metadata and fall back to country.
+  }
+
+  const country = String(account.country_id ?? "").trim().toUpperCase();
+  if (country === "BR") return "MLB";
+  if (country === "AR") return "MLA";
+  if (country === "MX") return "MLM";
+  if (country === "CL") return "MLC";
+  if (country === "CO") return "MCO";
+  return null;
+}
+
+function resolveMercadoLivreProductAdsSyncWindow(mode: "incremental" | "light" | "normal" | "full") {
+  const now = new Date();
+  const to = now.toISOString().slice(0, 10);
+  const from = new Date(now);
+  if (mode === "incremental") {
+    // Hoje. A API de Product Ads trabalha bem com agregação diária.
+  } else if (mode === "light") {
+    from.setUTCDate(from.getUTCDate() - 1);
+  } else if (mode === "normal") {
+    from.setUTCDate(from.getUTCDate() - 59);
+  } else {
+    from.setUTCDate(from.getUTCDate() - 364);
+  }
+  return {
+    dateFrom: from.toISOString().slice(0, 10),
+    dateTo: to,
+    label:
+      mode === "incremental"
+        ? "hoje"
+        : mode === "light"
+          ? "últimas 48h"
+          : mode === "normal"
+            ? "últimos 60 dias"
+            : "último ano",
+  };
+}
+
+function enumerateIsoDateRange(dateFrom: string, dateTo: string): string[] {
+  const startMs = Date.parse(`${dateFrom}T00:00:00.000Z`);
+  const endMs = Date.parse(`${dateTo}T00:00:00.000Z`);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return [];
+  const start = Math.min(startMs, endMs);
+  const end = Math.max(startMs, endMs);
+  const days: string[] = [];
+  for (let cursor = start; cursor <= end; cursor += 24 * 60 * 60 * 1000) {
+    days.push(new Date(cursor).toISOString().slice(0, 10));
+  }
+  return days;
+}
+
+function getMercadoLivreProductAdsDashboardFromDb(params: {
+  accountId: string | null;
+  dateFrom: string;
+  dateTo: string;
+}) {
+  const whereAccount = params.accountId ? "AND m.account_id = ?" : "";
+  const baseParams = params.accountId
+    ? [params.dateFrom, params.dateTo, params.accountId]
+    : [params.dateFrom, params.dateTo];
+  const totals =
+    (db
+      .prepare(
+        `SELECT COALESCE(SUM(cost_cents), 0) AS cost_cents,
+                COALESCE(SUM(impressions), 0) AS impressions,
+                COALESCE(SUM(clicks), 0) AS clicks,
+                COALESCE(SUM(ads_orders), 0) AS orders,
+                COALESCE(SUM(ads_revenue_cents), 0) AS revenue_cents
+         FROM marketplace_product_ads_daily_metrics m
+         WHERE m.marketplace = 'mercadolivre'
+           AND m.metric_date BETWEEN ? AND ?
+           ${whereAccount}`
+      )
+      .get(...baseParams) as any) ?? {};
+
+  const daily = db
+    .prepare(
+      `SELECT metric_date AS date,
+              COALESCE(SUM(cost_cents), 0) AS cost_cents,
+              COALESCE(SUM(impressions), 0) AS impressions,
+              COALESCE(SUM(clicks), 0) AS clicks,
+              COALESCE(SUM(ads_orders), 0) AS orders,
+              COALESCE(SUM(ads_revenue_cents), 0) AS revenue_cents
+       FROM marketplace_product_ads_daily_metrics m
+       WHERE m.marketplace = 'mercadolivre'
+         AND m.metric_date BETWEEN ? AND ?
+         ${whereAccount}
+       GROUP BY metric_date
+       ORDER BY metric_date ASC`
+    )
+    .all(...baseParams);
+
+  const accounts = db
+    .prepare(
+      `SELECT m.account_id,
+              a.seller_nickname,
+              m.advertiser_id,
+              'ok' AS status,
+              NULL AS message,
+              COALESCE(SUM(m.cost_cents), 0) AS cost_cents
+       FROM marketplace_product_ads_daily_metrics m
+       LEFT JOIN marketplace_accounts a ON a.id = m.account_id
+       WHERE m.marketplace = 'mercadolivre'
+         AND m.metric_date BETWEEN ? AND ?
+         ${whereAccount}
+       GROUP BY m.account_id, a.seller_nickname, m.advertiser_id
+       ORDER BY cost_cents DESC`
+    )
+    .all(...baseParams);
+
+  return {
+    date_from: params.dateFrom,
+    date_to: params.dateTo,
+    totals: {
+      cost_cents: Number(totals.cost_cents ?? 0),
+      impressions: Number(totals.impressions ?? 0),
+      clicks: Number(totals.clicks ?? 0),
+      orders: Number(totals.orders ?? 0),
+      revenue_cents: Number(totals.revenue_cents ?? 0),
+    },
+    daily,
+    accounts,
+  };
+}
+
 app.get("/integrations/mercadolivre/orders/dashboard", async (request) => {
   const query = mercadoLivreOrdersDashboardQuerySchema.parse(request.query ?? {});
   const accountId = query.account_id?.trim() || null;
+  const dateTo = query.date_to?.trim() || new Date().toISOString().slice(0, 10);
+  const dateFrom =
+    query.date_from?.trim() || new Date(Date.now() - 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
   const rows = (accountId
 	    ? db
@@ -4814,6 +5690,11 @@ app.get("/integrations/mercadolivre/orders/dashboard", async (request) => {
   return {
     marketplace: "mercadolivre",
     generated_at: nowIso(),
+    product_ads: getMercadoLivreProductAdsDashboardFromDb({
+      accountId,
+      dateFrom,
+      dateTo,
+    }),
     totals,
     accounts: Array.from(accounts.values()).sort((a, b) => b.gross_revenue_cents - a.gross_revenue_cents),
     filament_materials: Array.from(filamentMaterials.values()).sort((a, b) => b.total_cost_cents - a.total_cost_cents),
@@ -5145,7 +6026,11 @@ app.get("/sales/skus", async () => {
   const activeTaxRateBps = getActiveTaxRateBps();
   const updateSuggested = db.prepare(
     `UPDATE sales_skus
-     SET default_sale_price_cents = ?, production_cost_cents = ?,
+     SET default_sale_price_cents = CASE WHEN sync_final_sale_price_with_suggested = 1 THEN ? ELSE default_sale_price_cents END,
+         presential_sale_price_cents = CASE WHEN sync_presential_sale_price_with_suggested = 1 THEN ? ELSE presential_sale_price_cents END,
+         wholesale_consignment_price_cents = CASE WHEN sync_wholesale_consignment_price_with_suggested = 1 THEN ? ELSE wholesale_consignment_price_cents END,
+         wholesale_cash_price_cents = CASE WHEN sync_wholesale_cash_price_with_suggested = 1 THEN ? ELSE wholesale_cash_price_cents END,
+         production_cost_cents = ?,
          suggested_final_price_cents = ?, suggested_presential_price_cents = ?,
          suggested_wholesale_consignment_price_cents = ?, suggested_wholesale_cash_price_cents = ?,
          updated_at = ?
@@ -5162,7 +6047,10 @@ app.get("/sales/skus", async () => {
           markups,
         });
         updateSuggested.run(
-          recomputed.finalUnitCents,
+          suggested.suggested_final_price_cents,
+          suggested.suggested_presential_price_cents,
+          suggested.suggested_wholesale_consignment_price_cents,
+          suggested.suggested_wholesale_cash_price_cents,
           recomputed.subtotalUnitCents,
           suggested.suggested_final_price_cents,
           suggested.suggested_presential_price_cents,
@@ -5174,7 +6062,22 @@ app.get("/sales/skus", async () => {
         return withSkuContributionMargin(
           {
             ...row,
-            default_sale_price_cents: recomputed.finalUnitCents,
+            default_sale_price_cents:
+              Number(row.sync_final_sale_price_with_suggested ?? 1) === 1
+                ? suggested.suggested_final_price_cents
+                : row.default_sale_price_cents,
+            presential_sale_price_cents:
+              Number(row.sync_presential_sale_price_with_suggested ?? 1) === 1
+                ? suggested.suggested_presential_price_cents
+                : row.presential_sale_price_cents,
+            wholesale_consignment_price_cents:
+              Number(row.sync_wholesale_consignment_price_with_suggested ?? 1) === 1
+                ? suggested.suggested_wholesale_consignment_price_cents
+                : row.wholesale_consignment_price_cents,
+            wholesale_cash_price_cents:
+              Number(row.sync_wholesale_cash_price_with_suggested ?? 1) === 1
+                ? suggested.suggested_wholesale_cash_price_cents
+                : row.wholesale_cash_price_cents,
             production_cost_cents: recomputed.subtotalUnitCents,
             ...suggested,
             barcodes: getSkuBarcodes(String(row.id)),
@@ -5229,13 +6132,20 @@ app.get("/sales/skus/:id", async (request, reply) => {
       });
       db.prepare(
         `UPDATE sales_skus
-         SET default_sale_price_cents = ?, production_cost_cents = ?,
+         SET default_sale_price_cents = CASE WHEN sync_final_sale_price_with_suggested = 1 THEN ? ELSE default_sale_price_cents END,
+             presential_sale_price_cents = CASE WHEN sync_presential_sale_price_with_suggested = 1 THEN ? ELSE presential_sale_price_cents END,
+             wholesale_consignment_price_cents = CASE WHEN sync_wholesale_consignment_price_with_suggested = 1 THEN ? ELSE wholesale_consignment_price_cents END,
+             wholesale_cash_price_cents = CASE WHEN sync_wholesale_cash_price_with_suggested = 1 THEN ? ELSE wholesale_cash_price_cents END,
+             production_cost_cents = ?,
              suggested_final_price_cents = ?, suggested_presential_price_cents = ?,
              suggested_wholesale_consignment_price_cents = ?, suggested_wholesale_cash_price_cents = ?,
              updated_at = ?
-         WHERE id = ?`
+        WHERE id = ?`
       ).run(
-        recomputed.finalUnitCents,
+        suggested.suggested_final_price_cents,
+        suggested.suggested_presential_price_cents,
+        suggested.suggested_wholesale_consignment_price_cents,
+        suggested.suggested_wholesale_cash_price_cents,
         recomputed.subtotalUnitCents,
         suggested.suggested_final_price_cents,
         suggested.suggested_presential_price_cents,
@@ -5246,7 +6156,22 @@ app.get("/sales/skus/:id", async (request, reply) => {
       );
       resolvedSku = {
         ...sku,
-        default_sale_price_cents: recomputed.finalUnitCents,
+        default_sale_price_cents:
+          Number(sku.sync_final_sale_price_with_suggested ?? 1) === 1
+            ? suggested.suggested_final_price_cents
+            : sku.default_sale_price_cents,
+        presential_sale_price_cents:
+          Number(sku.sync_presential_sale_price_with_suggested ?? 1) === 1
+            ? suggested.suggested_presential_price_cents
+            : sku.presential_sale_price_cents,
+        wholesale_consignment_price_cents:
+          Number(sku.sync_wholesale_consignment_price_with_suggested ?? 1) === 1
+            ? suggested.suggested_wholesale_consignment_price_cents
+            : sku.wholesale_consignment_price_cents,
+        wholesale_cash_price_cents:
+          Number(sku.sync_wholesale_cash_price_with_suggested ?? 1) === 1
+            ? suggested.suggested_wholesale_cash_price_cents
+            : sku.wholesale_cash_price_cents,
         production_cost_cents: recomputed.subtotalUnitCents,
         ...suggested,
       };
@@ -5323,8 +6248,13 @@ app.post("/sales/skus", async (request, reply) => {
 
   const recomputedFromQuote =
     syncWithQuotePricing === 1 && sourceQuoteId ? recomputeQuoteWithActiveSettings(sourceQuoteId) : null;
+  const syncFinalSalePriceWithSuggested = body.sync_final_sale_price_with_suggested === false ? 0 : 1;
+  const syncPresentialSalePriceWithSuggested = body.sync_presential_sale_price_with_suggested === false ? 0 : 1;
+  const syncWholesaleConsignmentPriceWithSuggested =
+    body.sync_wholesale_consignment_price_with_suggested === false ? 0 : 1;
+  const syncWholesaleCashPriceWithSuggested = body.sync_wholesale_cash_price_with_suggested === false ? 0 : 1;
 
-  const resolvedDefaultSalePriceCents =
+  const suggestedFinalPriceBaseCents =
     typeof body.default_sale_price_cents === "number"
       ? body.default_sale_price_cents
       : recomputedFromQuote
@@ -5345,17 +6275,35 @@ app.post("/sales/skus", async (request, reply) => {
   const markups = getActiveSalesMarkupProfiles();
   const suggestedSalesPrices = computeSuggestedSalesPrices({
     productionCostCents: resolvedProductionCostCents,
-    finalPriceCents: resolvedDefaultSalePriceCents,
+    finalPriceCents: recomputedFromQuote ? recomputedFromQuote.finalUnitCents : suggestedFinalPriceBaseCents,
     markups,
   });
+  const resolvedDefaultSalePriceCents =
+    syncFinalSalePriceWithSuggested === 1
+      ? suggestedSalesPrices.suggested_final_price_cents
+      : suggestedFinalPriceBaseCents;
+  const resolvedPresentialSalePriceCents =
+    syncPresentialSalePriceWithSuggested === 1
+      ? suggestedSalesPrices.suggested_presential_price_cents
+      : typeof body.presential_sale_price_cents === "number"
+        ? body.presential_sale_price_cents
+        : suggestedSalesPrices.suggested_presential_price_cents;
   const resolvedWholesaleConsignmentPriceCents =
-    syncWithQuotePricing === 0 && typeof body.suggested_wholesale_consignment_price_cents === "number"
-      ? body.suggested_wholesale_consignment_price_cents
-      : suggestedSalesPrices.suggested_wholesale_consignment_price_cents;
+    syncWholesaleConsignmentPriceWithSuggested === 1
+      ? suggestedSalesPrices.suggested_wholesale_consignment_price_cents
+      : typeof body.wholesale_consignment_price_cents === "number"
+        ? body.wholesale_consignment_price_cents
+        : typeof body.suggested_wholesale_consignment_price_cents === "number"
+          ? body.suggested_wholesale_consignment_price_cents
+          : suggestedSalesPrices.suggested_wholesale_consignment_price_cents;
   const resolvedWholesaleCashPriceCents =
-    syncWithQuotePricing === 0 && typeof body.suggested_wholesale_cash_price_cents === "number"
-      ? body.suggested_wholesale_cash_price_cents
-      : suggestedSalesPrices.suggested_wholesale_cash_price_cents;
+    syncWholesaleCashPriceWithSuggested === 1
+      ? suggestedSalesPrices.suggested_wholesale_cash_price_cents
+      : typeof body.wholesale_cash_price_cents === "number"
+        ? body.wholesale_cash_price_cents
+        : typeof body.suggested_wholesale_cash_price_cents === "number"
+          ? body.suggested_wholesale_cash_price_cents
+          : suggestedSalesPrices.suggested_wholesale_cash_price_cents;
 
   const quoteMedia = body.copy_media_from_quote && sourceQuoteId
     ? (db
@@ -5405,10 +6353,13 @@ app.post("/sales/skus", async (request, reply) => {
       `INSERT INTO sales_skus (
         id, sku_code, name, description, default_sale_price_cents, production_cost_cents,
         parent_sku_id, source_quote_id, sync_with_quote_pricing,
+        presential_sale_price_cents, wholesale_consignment_price_cents, wholesale_cash_price_cents,
+        sync_final_sale_price_with_suggested, sync_presential_sale_price_with_suggested,
+        sync_wholesale_consignment_price_with_suggested, sync_wholesale_cash_price_with_suggested,
         suggested_final_price_cents, suggested_presential_price_cents,
         suggested_wholesale_consignment_price_cents, suggested_wholesale_cash_price_cents,
         is_active, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
     ).run(
       id,
       skuCode,
@@ -5419,10 +6370,17 @@ app.post("/sales/skus", async (request, reply) => {
       parentSkuId,
       sourceQuoteId,
       syncWithQuotePricing,
-      suggestedSalesPrices.suggested_final_price_cents,
-      suggestedSalesPrices.suggested_presential_price_cents,
+      resolvedPresentialSalePriceCents,
       resolvedWholesaleConsignmentPriceCents,
       resolvedWholesaleCashPriceCents,
+      syncFinalSalePriceWithSuggested,
+      syncPresentialSalePriceWithSuggested,
+      syncWholesaleConsignmentPriceWithSuggested,
+      syncWholesaleCashPriceWithSuggested,
+      suggestedSalesPrices.suggested_final_price_cents,
+      suggestedSalesPrices.suggested_presential_price_cents,
+      suggestedSalesPrices.suggested_wholesale_consignment_price_cents,
+      suggestedSalesPrices.suggested_wholesale_cash_price_cents,
       now,
       now
     );
@@ -5520,6 +6478,30 @@ app.put("/sales/skus/:id", async (request, reply) => {
 
   const recomputedFromQuote =
     syncWithQuotePricing === 1 && sourceQuoteId ? recomputeQuoteWithActiveSettings(sourceQuoteId) : null;
+  const syncFinalSalePriceWithSuggested =
+    typeof body.sync_final_sale_price_with_suggested === "boolean"
+      ? body.sync_final_sale_price_with_suggested
+        ? 1
+        : 0
+      : Number(existing.sync_final_sale_price_with_suggested ?? 1);
+  const syncPresentialSalePriceWithSuggested =
+    typeof body.sync_presential_sale_price_with_suggested === "boolean"
+      ? body.sync_presential_sale_price_with_suggested
+        ? 1
+        : 0
+      : Number(existing.sync_presential_sale_price_with_suggested ?? 1);
+  const syncWholesaleConsignmentPriceWithSuggested =
+    typeof body.sync_wholesale_consignment_price_with_suggested === "boolean"
+      ? body.sync_wholesale_consignment_price_with_suggested
+        ? 1
+        : 0
+      : Number(existing.sync_wholesale_consignment_price_with_suggested ?? 1);
+  const syncWholesaleCashPriceWithSuggested =
+    typeof body.sync_wholesale_cash_price_with_suggested === "boolean"
+      ? body.sync_wholesale_cash_price_with_suggested
+        ? 1
+        : 0
+      : Number(existing.sync_wholesale_cash_price_with_suggested ?? 1);
 
   const resolvedName =
     body.name.trim() ||
@@ -5531,7 +6513,7 @@ app.put("/sales/skus/:id", async (request, reply) => {
     (body.copy_from_quote && sourceQuote ? String(sourceQuote.description ?? "").trim() : "") ||
     String(existing.description ?? "").trim();
 
-  const resolvedDefaultSalePriceCents =
+  const suggestedFinalPriceBaseCents =
     typeof body.default_sale_price_cents === "number"
       ? body.default_sale_price_cents
       : recomputedFromQuote
@@ -5552,17 +6534,38 @@ app.put("/sales/skus/:id", async (request, reply) => {
   const markups = getActiveSalesMarkupProfiles();
   const suggestedSalesPrices = computeSuggestedSalesPrices({
     productionCostCents: resolvedProductionCostCents,
-    finalPriceCents: resolvedDefaultSalePriceCents,
+    finalPriceCents: recomputedFromQuote ? recomputedFromQuote.finalUnitCents : suggestedFinalPriceBaseCents,
     markups,
   });
+  const resolvedDefaultSalePriceCents =
+    syncFinalSalePriceWithSuggested === 1
+      ? suggestedSalesPrices.suggested_final_price_cents
+      : suggestedFinalPriceBaseCents;
+  const resolvedPresentialSalePriceCents =
+    syncPresentialSalePriceWithSuggested === 1
+      ? suggestedSalesPrices.suggested_presential_price_cents
+      : typeof body.presential_sale_price_cents === "number"
+        ? body.presential_sale_price_cents
+        : Number(existing.presential_sale_price_cents ?? suggestedSalesPrices.suggested_presential_price_cents);
   const resolvedWholesaleConsignmentPriceCents =
-    syncWithQuotePricing === 0 && typeof body.suggested_wholesale_consignment_price_cents === "number"
-      ? body.suggested_wholesale_consignment_price_cents
-      : suggestedSalesPrices.suggested_wholesale_consignment_price_cents;
+    syncWholesaleConsignmentPriceWithSuggested === 1
+      ? suggestedSalesPrices.suggested_wholesale_consignment_price_cents
+      : typeof body.wholesale_consignment_price_cents === "number"
+        ? body.wholesale_consignment_price_cents
+        : typeof body.suggested_wholesale_consignment_price_cents === "number"
+          ? body.suggested_wholesale_consignment_price_cents
+          : Number(
+              existing.wholesale_consignment_price_cents ??
+                suggestedSalesPrices.suggested_wholesale_consignment_price_cents
+            );
   const resolvedWholesaleCashPriceCents =
-    syncWithQuotePricing === 0 && typeof body.suggested_wholesale_cash_price_cents === "number"
-      ? body.suggested_wholesale_cash_price_cents
-      : suggestedSalesPrices.suggested_wholesale_cash_price_cents;
+    syncWholesaleCashPriceWithSuggested === 1
+      ? suggestedSalesPrices.suggested_wholesale_cash_price_cents
+      : typeof body.wholesale_cash_price_cents === "number"
+        ? body.wholesale_cash_price_cents
+        : typeof body.suggested_wholesale_cash_price_cents === "number"
+          ? body.suggested_wholesale_cash_price_cents
+          : Number(existing.wholesale_cash_price_cents ?? suggestedSalesPrices.suggested_wholesale_cash_price_cents);
 
   const existingMedia = db
     .prepare("SELECT media_type, local_uri FROM sales_sku_media WHERE sku_id = ?")
@@ -5617,6 +6620,9 @@ app.put("/sales/skus/:id", async (request, reply) => {
       `UPDATE sales_skus
        SET sku_code = ?, name = ?, description = ?, default_sale_price_cents = ?,
            production_cost_cents = ?, parent_sku_id = ?, source_quote_id = ?, sync_with_quote_pricing = ?,
+           presential_sale_price_cents = ?, wholesale_consignment_price_cents = ?, wholesale_cash_price_cents = ?,
+           sync_final_sale_price_with_suggested = ?, sync_presential_sale_price_with_suggested = ?,
+           sync_wholesale_consignment_price_with_suggested = ?, sync_wholesale_cash_price_with_suggested = ?,
            suggested_final_price_cents = ?, suggested_presential_price_cents = ?,
            suggested_wholesale_consignment_price_cents = ?, suggested_wholesale_cash_price_cents = ?,
            updated_at = ?
@@ -5630,10 +6636,17 @@ app.put("/sales/skus/:id", async (request, reply) => {
       parentSkuId,
       sourceQuoteId,
       syncWithQuotePricing,
-      suggestedSalesPrices.suggested_final_price_cents,
-      suggestedSalesPrices.suggested_presential_price_cents,
+      resolvedPresentialSalePriceCents,
       resolvedWholesaleConsignmentPriceCents,
       resolvedWholesaleCashPriceCents,
+      syncFinalSalePriceWithSuggested,
+      syncPresentialSalePriceWithSuggested,
+      syncWholesaleConsignmentPriceWithSuggested,
+      syncWholesaleCashPriceWithSuggested,
+      suggestedSalesPrices.suggested_final_price_cents,
+      suggestedSalesPrices.suggested_presential_price_cents,
+      suggestedSalesPrices.suggested_wholesale_consignment_price_cents,
+      suggestedSalesPrices.suggested_wholesale_cash_price_cents,
       now,
       id
     );
@@ -6093,6 +7106,132 @@ app.post("/sales/consignment/batches", async (request, reply) => {
   return db.prepare("SELECT * FROM consignment_batches WHERE id = ?").get(batchId);
 });
 
+app.get("/sales/consignment/dashboard", async (request) => {
+  const query = consignmentDashboardQuerySchema.parse(request.query ?? {});
+  const dateFrom = normalizeDateFilterBoundary(query.date_from?.trim() || null, "start");
+  const dateTo = normalizeDateFilterBoundary(query.date_to?.trim() || null, "end");
+  const salesPointId = query.sales_point_id?.trim() || null;
+
+  const totals = db
+    .prepare(
+      `WITH item_totals AS (
+         SELECT cbi.id,
+                cbi.quantity_sent,
+                COALESCE((SELECT SUM(sold_quantity) FROM consignment_sales cs WHERE cs.batch_item_id = cbi.id), 0) AS sold_quantity,
+                COALESCE((SELECT SUM(returned_quantity) FROM consignment_returns cr WHERE cr.batch_item_id = cbi.id), 0) AS returned_quantity
+         FROM consignment_batch_items cbi
+       )
+       SELECT
+         COALESCE((SELECT SUM(sold_quantity) FROM consignment_sales), 0) AS sold_items_count,
+         COALESCE(SUM(item_totals.quantity_sent - item_totals.sold_quantity - item_totals.returned_quantity), 0) AS available_items_count,
+         COALESCE((
+           SELECT COUNT(*)
+           FROM (
+             SELECT cb.sales_point_id
+             FROM consignment_batch_items cbi
+             JOIN consignment_batches cb ON cb.id = cbi.batch_id
+             JOIN sales_points sp ON sp.id = cb.sales_point_id
+             WHERE sp.is_active = 1
+             GROUP BY cb.sales_point_id
+             HAVING
+               SUM(
+                 cbi.quantity_sent
+                 - COALESCE((SELECT SUM(sold_quantity) FROM consignment_sales cs WHERE cs.batch_item_id = cbi.id), 0)
+                 - COALESCE((SELECT SUM(returned_quantity) FROM consignment_returns cr WHERE cr.batch_item_id = cbi.id), 0)
+               ) > 0
+           )
+         ), 0) AS active_sales_points_count
+       FROM item_totals`
+    )
+    .get() as {
+    sold_items_count: number;
+    available_items_count: number;
+    active_sales_points_count: number;
+  };
+
+  const filters = `
+    WHERE (? IS NULL OR event_at >= ?)
+      AND (? IS NULL OR event_at <= ?)
+      AND (? IS NULL OR sales_point_id = ?)
+  `;
+  const params = [dateFrom, dateFrom, dateTo, dateTo, salesPointId, salesPointId];
+
+  const movements = db
+    .prepare(
+      `WITH movements AS (
+         SELECT 'sent' AS movement_type,
+                cbi.id AS batch_item_id,
+                cb.id AS batch_id,
+                cb.sales_point_id,
+                sp.name AS sales_point_name,
+                cbi.sku_id,
+                s.sku_code,
+                s.name AS sku_name,
+                cbi.quantity_sent AS quantity,
+                cb.dispatched_at AS event_at,
+                cb.notes AS notes,
+                cb.created_at
+         FROM consignment_batch_items cbi
+         JOIN consignment_batches cb ON cb.id = cbi.batch_id
+         JOIN sales_points sp ON sp.id = cb.sales_point_id
+         JOIN sales_skus s ON s.id = cbi.sku_id
+         UNION ALL
+         SELECT 'sold' AS movement_type,
+                cbi.id AS batch_item_id,
+                cb.id AS batch_id,
+                cb.sales_point_id,
+                sp.name AS sales_point_name,
+                cbi.sku_id,
+                s.sku_code,
+                s.name AS sku_name,
+                cs.sold_quantity AS quantity,
+                cs.sold_at AS event_at,
+                cs.notes AS notes,
+                cs.created_at
+         FROM consignment_sales cs
+         JOIN consignment_batch_items cbi ON cbi.id = cs.batch_item_id
+         JOIN consignment_batches cb ON cb.id = cbi.batch_id
+         JOIN sales_points sp ON sp.id = cb.sales_point_id
+         JOIN sales_skus s ON s.id = cbi.sku_id
+         UNION ALL
+         SELECT 'returned' AS movement_type,
+                cbi.id AS batch_item_id,
+                cb.id AS batch_id,
+                cb.sales_point_id,
+                sp.name AS sales_point_name,
+                cbi.sku_id,
+                s.sku_code,
+                s.name AS sku_name,
+                cr.returned_quantity AS quantity,
+                cr.returned_at AS event_at,
+                cr.notes AS notes,
+                cr.created_at
+         FROM consignment_returns cr
+         JOIN consignment_batch_items cbi ON cbi.id = cr.batch_item_id
+         JOIN consignment_batches cb ON cb.id = cbi.batch_id
+         JOIN sales_points sp ON sp.id = cb.sales_point_id
+         JOIN sales_skus s ON s.id = cbi.sku_id
+       )
+       SELECT *
+       FROM movements
+       ${filters}
+       ORDER BY event_at DESC, created_at DESC
+       LIMIT ?`
+    )
+    .all(...params, query.limit);
+
+  return {
+    generated_at: nowIso(),
+    totals,
+    filters: {
+      date_from: dateFrom,
+      date_to: dateTo,
+      sales_point_id: salesPointId,
+    },
+    movements,
+  };
+});
+
 app.get("/sales/consignment/batches", async () => {
   return db
     .prepare(
@@ -6148,6 +7287,135 @@ app.get("/sales/consignment/batches/:id", async (request, reply) => {
   return {
     ...batch,
     items,
+  };
+});
+
+app.post("/sales/consignment/points/:pointId/sales", async (request, reply) => {
+  const { pointId } = request.params as { pointId: string };
+  const body = consignmentPointSaleSchema.parse(request.body);
+  const point = db.prepare("SELECT id FROM sales_points WHERE id = ? AND is_active = 1").get(pointId) as any;
+  if (!point) {
+    reply.code(404);
+    return { message: "Sales point not found or inactive" };
+  }
+
+  const candidates = getOpenConsignmentBatchItemsForPointSku(pointId, body.sku_id);
+  const totalAvailable = candidates.reduce((sum, item) => sum + item.remaining_quantity, 0);
+  if (totalAvailable < body.sold_quantity) {
+    reply.code(400);
+    return { message: "Sold quantity exceeds stock at point", available_quantity: totalAvailable };
+  }
+
+  const now = nowIso();
+  const soldAt = body.sold_at?.trim() || now;
+  let remaining = body.sold_quantity;
+  const saleIds: string[] = [];
+  const tx = db.transaction(() => {
+    for (const item of candidates) {
+      if (remaining <= 0) break;
+      const quantity = Math.min(remaining, item.remaining_quantity);
+      const saleId = uuidv4();
+      saleIds.push(saleId);
+      db.prepare(
+        `INSERT INTO consignment_sales (id, batch_item_id, sold_quantity, sold_at, notes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(saleId, item.id, quantity, soldAt, body.notes.trim() || null, now, now);
+      remaining -= quantity;
+    }
+  });
+  tx();
+
+  appendOperationLog({
+    eventType: "consignment_sale_registered",
+    entityType: "sales_point",
+    entityId: pointId,
+    summary: "Venda registrada em ponto de consignação",
+    payload: {
+      sales_point_id: pointId,
+      sku_id: body.sku_id,
+      sold_quantity: body.sold_quantity,
+      sold_at: soldAt,
+      sale_ids: saleIds,
+      notes: body.notes.trim() || null,
+    },
+  });
+
+  reply.code(201);
+  return { ok: true, sales_point_id: pointId, sku_id: body.sku_id, sold_quantity: body.sold_quantity, sale_ids: saleIds };
+});
+
+app.post("/sales/consignment/points/:pointId/returns", async (request, reply) => {
+  const { pointId } = request.params as { pointId: string };
+  const body = consignmentPointReturnSchema.parse(request.body);
+  const point = db.prepare("SELECT id FROM sales_points WHERE id = ? AND is_active = 1").get(pointId) as any;
+  if (!point) {
+    reply.code(404);
+    return { message: "Sales point not found or inactive" };
+  }
+
+  const candidates = getOpenConsignmentBatchItemsForPointSku(pointId, body.sku_id);
+  const totalAvailable = candidates.reduce((sum, item) => sum + item.remaining_quantity, 0);
+  if (totalAvailable < body.returned_quantity) {
+    reply.code(400);
+    return { message: "Returned quantity exceeds stock at point", available_quantity: totalAvailable };
+  }
+
+  const now = nowIso();
+  const returnedAt = body.returned_at?.trim() || now;
+  let remaining = body.returned_quantity;
+  const returnIds: string[] = [];
+  const tx = db.transaction(() => {
+    for (const item of candidates) {
+      if (remaining <= 0) break;
+      const quantity = Math.min(remaining, item.remaining_quantity);
+      const returnId = uuidv4();
+      returnIds.push(returnId);
+      db.prepare(
+        `INSERT INTO consignment_returns (id, batch_item_id, returned_quantity, returned_at, notes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(returnId, item.id, quantity, returnedAt, body.notes.trim() || null, now, now);
+      db.prepare(
+        `INSERT INTO stock_movements (
+          id, sku_id, movement_type, quantity_delta, occurred_at, reference_type, reference_id, notes, created_at, updated_at
+        ) VALUES (?, ?, 'consignment_return', ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        uuidv4(),
+        body.sku_id,
+        quantity,
+        returnedAt,
+        "consignment_batch_item",
+        item.id,
+        body.notes.trim() || null,
+        now,
+        now
+      );
+      remaining -= quantity;
+    }
+  });
+  tx();
+
+  appendOperationLog({
+    eventType: "consignment_return_registered",
+    entityType: "sales_point",
+    entityId: pointId,
+    summary: "Retirada registrada em ponto de consignação",
+    payload: {
+      sales_point_id: pointId,
+      sku_id: body.sku_id,
+      returned_quantity: body.returned_quantity,
+      returned_at: returnedAt,
+      return_ids: returnIds,
+      notes: body.notes.trim() || null,
+    },
+  });
+
+  reply.code(201);
+  return {
+    ok: true,
+    sales_point_id: pointId,
+    sku_id: body.sku_id,
+    returned_quantity: body.returned_quantity,
+    return_ids: returnIds,
   };
 });
 
@@ -7302,37 +8570,82 @@ function startMercadoLivreOrdersScheduler(): NodeJS.Timeout[] {
   const timers: NodeJS.Timeout[] = [];
 
   const runJob = async (accountId: string, job: ScheduledMercadoLivreOrdersJob) => {
-    const key = accountId;
-    if (runningKeys.has(key)) {
-      app.log.info({ account_id: accountId, mode: job.mode }, "Skipping scheduled orders sync already running.");
-      return;
-    }
-    if (marketplaceOrdersSyncRunningAccounts.has(accountId)) {
-      app.log.info({ account_id: accountId, mode: job.mode }, "Skipping scheduled orders sync because account is busy.");
-      return;
-    }
+    return runWithSpan(
+      "mercadolivre.scheduler.orders",
+      {
+        "marketplace.name": "mercadolivre",
+        "marketplace.account_id": accountId,
+        "marketplace.scheduler.job_mode": job.mode,
+        "marketplace.scheduler.interval_minutes": job.intervalMinutes,
+      },
+      async (span) => {
+        const key = accountId;
+        if (runningKeys.has(key)) {
+          span.setAttribute("marketplace.scheduler.skipped", true);
+          span.setAttribute("marketplace.scheduler.skip_reason", "scheduler_job_already_running");
+          appendOperationLog({
+            eventType: "marketplace_orders_read_failed",
+            entityType: "marketplace_scheduler",
+            summary: "Sincronização automática de pedidos Mercado Livre ignorada: tarefa já em execução",
+            payload: {
+              marketplace: "mercadolivre",
+              account_id: accountId,
+              sync_type: "orders_read",
+              sync_mode: job.mode,
+              sync_source: "scheduler",
+              phase: "skipped",
+              message: "Tarefa agendada já estava em execução para esta conta.",
+            },
+          });
+          app.log.info({ account_id: accountId, mode: job.mode }, "Skipping scheduled orders sync already running.");
+          return;
+        }
+        if (marketplaceOrdersSyncRunningAccounts.has(accountId)) {
+          span.setAttribute("marketplace.scheduler.skipped", true);
+          span.setAttribute("marketplace.scheduler.skip_reason", "account_sync_already_running");
+          appendOperationLog({
+            eventType: "marketplace_orders_read_failed",
+            entityType: "marketplace_scheduler",
+            summary: "Sincronização automática de pedidos Mercado Livre ignorada: conta ocupada",
+            payload: {
+              marketplace: "mercadolivre",
+              account_id: accountId,
+              sync_type: "orders_read",
+              sync_mode: job.mode,
+              sync_source: "scheduler",
+              phase: "skipped",
+              message: "Já existe uma sincronização em andamento para esta conta.",
+            },
+          });
+          app.log.info({ account_id: accountId, mode: job.mode }, "Skipping scheduled orders sync because account is busy.");
+          return;
+        }
 
-    runningKeys.add(key);
-    const startedAt = nowIso();
-    markSchedulerJobStarted(accountId, job, startedAt);
+        runningKeys.add(key);
+        const startedAt = nowIso();
+        markSchedulerJobStarted(accountId, job, startedAt);
 
-    try {
-      app.log.info({ account_id: accountId, mode: job.mode }, "Starting scheduled Mercado Livre orders sync.");
-      const response = await app.inject({
-        method: "POST",
-        url: "/integrations/mercadolivre/sync/orders",
-        headers: { "content-type": "application/json" },
-        payload: JSON.stringify({ account_id: accountId, mode: job.mode }),
-      });
+        try {
+          app.log.info({ account_id: accountId, mode: job.mode }, "Starting scheduled Mercado Livre orders sync.");
+          const response = await app.inject({
+            method: "POST",
+            url: "/integrations/mercadolivre/sync/orders",
+            headers: { "content-type": "application/json" },
+            payload: JSON.stringify({ account_id: accountId, mode: job.mode, source: "scheduler" }),
+          });
 
-      const finishedAt = nowIso();
-      let parsed = {} as { run_id?: string; message?: string };
-      try {
-        parsed = response.json<{ run_id?: string; message?: string }>();
-      } catch {
-        parsed = {};
-      }
-      if (response.statusCode >= 400) {
+          const finishedAt = nowIso();
+          let parsed = {} as { run_id?: string; message?: string };
+          try {
+            parsed = response.json<{ run_id?: string; message?: string }>();
+          } catch {
+            parsed = {};
+          }
+          span.setAttribute("marketplace.scheduler.status_code", response.statusCode);
+          if (parsed.run_id) {
+            span.setAttribute("marketplace.sync.run_id", parsed.run_id);
+          }
+          if (response.statusCode >= 400) {
         markSchedulerJobFinished({
           accountId,
           job,
@@ -7341,11 +8654,83 @@ function startMercadoLivreOrdersScheduler(): NodeJS.Timeout[] {
           runId: parsed.run_id ?? null,
           message: parsed.message ?? response.body,
         });
+        if (!parsed.run_id) {
+          appendOperationLog({
+            eventType: "marketplace_orders_read_failed",
+            entityType: "marketplace_scheduler",
+            summary: "Sincronização automática de pedidos Mercado Livre não iniciada",
+            payload: {
+              marketplace: "mercadolivre",
+              account_id: accountId,
+              sync_type: "orders_read",
+              sync_mode: job.mode,
+              sync_source: "scheduler",
+              phase: "error",
+              status_code: response.statusCode,
+              message: parsed.message ?? response.body,
+            },
+          });
+        }
         app.log.error(
           { account_id: accountId, mode: job.mode, status_code: response.statusCode, body: response.body },
           "Scheduled Mercado Livre orders sync failed."
         );
-      } else {
+          } else {
+            if (job.mode === "incremental") {
+              const adsResponse = await app.inject({
+                method: "POST",
+                url: "/integrations/mercadolivre/sync/product-ads",
+                headers: { "content-type": "application/json" },
+                payload: JSON.stringify({ account_id: accountId, mode: "incremental", source: "scheduler" }),
+              });
+              let parsedAds = {} as { run_id?: string; records_read?: number; records_upserted?: number; records_failed?: number; message?: string };
+              try {
+                parsedAds = adsResponse.json<{
+                  run_id?: string;
+                  records_read?: number;
+                  records_upserted?: number;
+                  records_failed?: number;
+                  message?: string;
+                }>();
+              } catch {
+                parsedAds = {};
+              }
+              span.setAttribute("marketplace.scheduler.product_ads_status_code", adsResponse.statusCode);
+              if (parsedAds.run_id) {
+                span.setAttribute("marketplace.scheduler.product_ads_run_id", parsedAds.run_id);
+              }
+              span.addEvent("product_ads.scheduler.finished", {
+                "marketplace.account_id": accountId,
+                "marketplace.scheduler.product_ads_status_code": adsResponse.statusCode,
+                "marketplace.sync.run_id": parsedAds.run_id ?? "",
+                "marketplace.sync.records_read": parsedAds.records_read ?? 0,
+                "marketplace.sync.records_upserted": parsedAds.records_upserted ?? 0,
+                "marketplace.sync.records_failed": parsedAds.records_failed ?? 0,
+              });
+              if (adsResponse.statusCode >= 400) {
+                appendOperationLog({
+                  eventType: "marketplace_product_ads_read_failed",
+                  entityType: "marketplace_scheduler",
+                  summary: "Sincronização automática de Product Ads Mercado Livre falhou",
+                  payload: {
+                    marketplace: "mercadolivre",
+                    account_id: accountId,
+                    sync_type: "product_ads_read",
+                    sync_mode: "incremental",
+                    sync_source: "scheduler",
+                    phase: "error",
+                    status_code: adsResponse.statusCode,
+                    run_id: parsedAds.run_id ?? null,
+                    message: parsedAds.message ?? adsResponse.body,
+                  },
+                });
+                app.log.error(
+                  { account_id: accountId, mode: job.mode, status_code: adsResponse.statusCode, body: adsResponse.body },
+                  "Scheduled Mercado Livre Product Ads sync failed."
+                );
+              }
+            }
+
         markSchedulerJobFinished({
           accountId,
           job,
@@ -7358,8 +8743,8 @@ function startMercadoLivreOrdersScheduler(): NodeJS.Timeout[] {
           { account_id: accountId, mode: job.mode, status_code: response.statusCode },
           "Scheduled Mercado Livre orders sync finished."
         );
-      }
-    } catch (error: any) {
+          }
+        } catch (error: any) {
       markSchedulerJobFinished({
         accountId,
         job,
@@ -7367,10 +8752,26 @@ function startMercadoLivreOrdersScheduler(): NodeJS.Timeout[] {
         status: "error",
         message: error?.message ?? "Scheduled sync crashed.",
       });
+      appendOperationLog({
+        eventType: "marketplace_orders_read_failed",
+        entityType: "marketplace_scheduler",
+        summary: "Sincronização automática de pedidos Mercado Livre falhou antes de concluir",
+        payload: {
+          marketplace: "mercadolivre",
+          account_id: accountId,
+          sync_type: "orders_read",
+          sync_mode: job.mode,
+          sync_source: "scheduler",
+          phase: "error",
+          message: error?.message ?? "Scheduled sync crashed.",
+        },
+      });
       app.log.error({ account_id: accountId, mode: job.mode, error }, "Scheduled Mercado Livre orders sync crashed.");
-    } finally {
+        } finally {
       runningKeys.delete(key);
-    }
+        }
+      }
+    );
   };
 
   const tick = async () => {

@@ -110,12 +110,19 @@ type SalesSku = {
   name: string;
   description: string;
   defaultSalePriceCents: number;
+  presentialSalePriceCents: number;
+  wholesaleConsignmentPriceCents: number;
+  wholesaleCashPriceCents: number;
   productionCostCents: number;
   estimatedTaxCents?: number;
   taxRateBpsApplied?: number;
   contributionMarginCents?: number;
   contributionMarginBps?: number;
   syncWithQuotePricing: boolean;
+  syncFinalSalePriceWithSuggested: boolean;
+  syncPresentialSalePriceWithSuggested: boolean;
+  syncWholesaleConsignmentPriceWithSuggested: boolean;
+  syncWholesaleCashPriceWithSuggested: boolean;
   suggestedFinalPriceCents: number;
   suggestedPresentialPriceCents: number;
   suggestedWholesaleConsignmentPriceCents: number;
@@ -203,6 +210,30 @@ type ConsignmentBatchDetail = {
   status: "open" | "closed";
   notes: string;
   items: ConsignmentBatchItem[];
+};
+
+type ConsignmentDashboardMovement = {
+  movementType: "sent" | "sold" | "returned";
+  batchItemId: string;
+  batchId: string;
+  salesPointId: string;
+  salesPointName: string;
+  skuId: string;
+  skuCode: string;
+  skuName: string;
+  quantity: number;
+  eventAt: string;
+  notes: string;
+};
+
+type ConsignmentDashboard = {
+  generatedAt: string;
+  totals: {
+    soldItemsCount: number;
+    availableItemsCount: number;
+    activeSalesPointsCount: number;
+  };
+  movements: ConsignmentDashboardMovement[];
 };
 
 type SalesPointOverviewProduct = {
@@ -493,6 +524,33 @@ type MarketplaceOrderItem = {
 type MarketplaceOrdersDashboardResponse = {
   marketplace: string;
   generated_at: string;
+  product_ads?: {
+    date_from: string;
+    date_to: string;
+    totals: {
+      cost_cents: number;
+      impressions: number;
+      clicks: number;
+      orders: number;
+      revenue_cents: number;
+    };
+    daily: Array<{
+      date: string;
+      cost_cents: number;
+      impressions: number;
+      clicks: number;
+      orders: number;
+      revenue_cents: number;
+    }>;
+    accounts: Array<{
+      account_id: string;
+      seller_nickname: string | null;
+      advertiser_id: string | null;
+      status: "ok" | "unavailable" | "error";
+      message: string | null;
+      cost_cents: number;
+    }>;
+  };
   totals: {
     orders_count: number;
     orders_with_net_received: number;
@@ -604,6 +662,14 @@ function maskNameKeepCode(code: string | null | undefined, name: string | null |
   if (!normalizedCode && !normalizedName) return "";
   if (!enabled) return [normalizedCode, normalizedName].filter(Boolean).join(" - ");
   return normalizedCode ? `${normalizedCode} - ${PRIVACY_MASK}` : PRIVACY_MASK;
+}
+
+function maskNameOrCode(name: string | null | undefined, code: string | null | undefined, enabled: boolean): string {
+  const normalizedName = (name ?? "").trim();
+  const normalizedCode = (code ?? "").trim();
+  const text = normalizedName || normalizedCode;
+  if (!text) return "";
+  return enabled ? PRIVACY_MASK : text;
 }
 
 function toSelectOptions(options: Array<string | SelectOption>): SelectOption[] {
@@ -994,12 +1060,21 @@ function mapSalesSkuFromApi(row: any): SalesSku {
     name: row.name,
     description: row.description ?? "",
     defaultSalePriceCents: row.default_sale_price_cents ?? 0,
+    presentialSalePriceCents: row.presential_sale_price_cents ?? row.suggested_presential_price_cents ?? 0,
+    wholesaleConsignmentPriceCents:
+      row.wholesale_consignment_price_cents ?? row.suggested_wholesale_consignment_price_cents ?? 0,
+    wholesaleCashPriceCents: row.wholesale_cash_price_cents ?? row.suggested_wholesale_cash_price_cents ?? 0,
     productionCostCents: row.production_cost_cents ?? 0,
     estimatedTaxCents: row.estimated_tax_cents,
     taxRateBpsApplied: row.tax_rate_bps_applied,
     contributionMarginCents: row.contribution_margin_cents,
     contributionMarginBps: row.contribution_margin_bps,
     syncWithQuotePricing: Number(row.sync_with_quote_pricing ?? 0) === 1,
+    syncFinalSalePriceWithSuggested: Number(row.sync_final_sale_price_with_suggested ?? 1) === 1,
+    syncPresentialSalePriceWithSuggested: Number(row.sync_presential_sale_price_with_suggested ?? 1) === 1,
+    syncWholesaleConsignmentPriceWithSuggested:
+      Number(row.sync_wholesale_consignment_price_with_suggested ?? 1) === 1,
+    syncWholesaleCashPriceWithSuggested: Number(row.sync_wholesale_cash_price_with_suggested ?? 1) === 1,
     suggestedFinalPriceCents: row.suggested_final_price_cents ?? row.default_sale_price_cents ?? 0,
     suggestedPresentialPriceCents: row.suggested_presential_price_cents ?? 0,
     suggestedWholesaleConsignmentPriceCents: row.suggested_wholesale_consignment_price_cents ?? 0,
@@ -1094,6 +1169,30 @@ function mapConsignmentBatchDetailFromApi(row: any): ConsignmentBatchDetail {
       unitSalePriceCents: item.unit_sale_price_cents ?? 0,
       expectedRevenueCents: item.expected_revenue_cents ?? 0,
       realizedRevenueCents: item.realized_revenue_cents ?? 0,
+    })),
+  };
+}
+
+function mapConsignmentDashboardFromApi(row: any): ConsignmentDashboard {
+  return {
+    generatedAt: row.generated_at ?? "",
+    totals: {
+      soldItemsCount: row.totals?.sold_items_count ?? 0,
+      availableItemsCount: row.totals?.available_items_count ?? 0,
+      activeSalesPointsCount: row.totals?.active_sales_points_count ?? 0,
+    },
+    movements: (row.movements ?? []).map((item: any) => ({
+      movementType: item.movement_type ?? "sent",
+      batchItemId: item.batch_item_id ?? "",
+      batchId: item.batch_id ?? "",
+      salesPointId: item.sales_point_id ?? "",
+      salesPointName: item.sales_point_name ?? "",
+      skuId: item.sku_id ?? "",
+      skuCode: item.sku_code ?? "",
+      skuName: item.sku_name ?? "",
+      quantity: item.quantity ?? 0,
+      eventAt: item.event_at ?? "",
+      notes: item.notes ?? "",
     })),
   };
 }
@@ -1696,9 +1795,9 @@ function SelectField({
 function DashboardScreen({ goTo }: { goTo: (key: ScreenKey) => void }) {
   return (
     <ScrollView contentContainerStyle={styles.content}>
-      <Text style={styles.pageTitle}>Dashboard</Text>
-      <Text style={styles.pageSubtitle}>Atalhos do modulo de precificacao</Text>
-      <Section title="Cadastros">
+      <Text style={styles.pageTitle}>Home</Text>
+      <Text style={styles.pageSubtitle}>Atalhos do menu principal</Text>
+      <Section title="Orçamentos">
         <View style={styles.dashboardNavRow}>
           <NavButton label="Impressoras" onPress={() => goTo("printers")} />
         </View>
@@ -1706,37 +1805,47 @@ function DashboardScreen({ goTo }: { goTo: (key: ScreenKey) => void }) {
           <NavButton label="Filamentos" onPress={() => goTo("filaments")} />
         </View>
         <View style={styles.dashboardNavRow}>
+          <NavButton label="Orçamentos" onPress={() => goTo("quotes")} />
+        </View>
+      </Section>
+      <Section title="Estoque">
+        <View style={styles.dashboardNavRow}>
+          <NavButton label="Cadastro de SKU" onPress={() => goTo("salesSkus")} />
+        </View>
+        <View style={styles.dashboardNavRow}>
+          <NavButton label="Movimentação de estoque" onPress={() => goTo("salesStock")} />
+        </View>
+      </Section>
+      <Section title="Consignado">
+        <View style={styles.dashboardNavRow}>
+          <NavButton label="Visão dos pontos" onPress={() => goTo("salesPointsOverview")} />
+        </View>
+        <View style={styles.dashboardNavRow}>
+          <NavButton label="Consignação" onPress={() => goTo("salesConsignment")} />
+        </View>
+        <View style={styles.dashboardNavRow}>
+          <NavButton label="Pontos" onPress={() => goTo("salesPoints")} />
+        </View>
+      </Section>
+      <Section title="Custos">
+        <View style={styles.dashboardNavRow}>
           <NavButton label="Custos" onPress={() => goTo("fixedCosts")} />
         </View>
       </Section>
-      <Section title="Orçamentos">
+      <Section title="Marketplaces">
         <View style={styles.dashboardNavRow}>
-          <NavButton label="Lista de Orçamentos" onPress={() => goTo("quotes")} />
+          <NavButton label="Configurações" onPress={() => goTo("marketplaces")} />
         </View>
         <View style={styles.dashboardNavRow}>
-          <NavButton label="Novo Orçamento" onPress={() => goTo("quoteForm")} />
-        </View>
-      </Section>
-      <Section title="Vendas Consignado">
-        <View style={styles.dashboardNavRow}>
-          <NavButton label="Cadastro de SKUs" onPress={() => goTo("salesSkus")} />
+          <NavButton label="Dashboard pedidos" onPress={() => goTo("marketplaceOrdersDashboard")} />
         </View>
         <View style={styles.dashboardNavRow}>
-          <NavButton label="Estoque Geral" onPress={() => goTo("salesStock")} />
-        </View>
-        <View style={styles.dashboardNavRow}>
-          <NavButton label="Pontos de Venda" onPress={() => goTo("salesPoints")} />
-        </View>
-        <View style={styles.dashboardNavRow}>
-          <NavButton label="Controle no Ponto" onPress={() => goTo("salesConsignment")} />
-        </View>
-        <View style={styles.dashboardNavRow}>
-          <NavButton label="Visão Geral dos Pontos" onPress={() => goTo("salesPointsOverview")} />
+          <NavButton label="Anúncios" onPress={() => goTo("marketplaceListings")} />
         </View>
       </Section>
-      <Section title="Integrações">
+      <Section title="Logs">
         <View style={styles.dashboardNavRow}>
-          <NavButton label="Marketplaces > Configurações" onPress={() => goTo("marketplaces")} />
+          <NavButton label="Logs" onPress={() => goTo("logs")} />
         </View>
       </Section>
     </ScrollView>
@@ -1872,10 +1981,19 @@ function FilamentsScreen({
   onEdit: (filamentId: string) => void;
   onDelete: (filamentId: string) => void;
 }) {
+  const sortedFilaments = [...filaments].sort((a, b) =>
+    a.name.localeCompare(b.name, "pt-BR", { sensitivity: "base" })
+  );
+
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <Text style={styles.pageTitle}>Filamentos</Text>
-      {filaments.map((f) => {
+      <Pressable style={styles.primaryButtonFixed} onPress={onCreate}>
+        <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+          Cadastrar novo filamento
+        </Text>
+      </Pressable>
+      {sortedFilaments.map((f) => {
         const perGram = f.purchaseCostCents / f.purchasedWeightGrams;
         const perKg = perGram * 1000;
         return (
@@ -1902,11 +2020,6 @@ function FilamentsScreen({
           </View>
         );
       })}
-      <Pressable style={styles.primaryButtonFixed} onPress={onCreate}>
-        <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
-          Cadastrar novo filamento
-        </Text>
-      </Pressable>
     </ScrollView>
   );
 }
@@ -2140,10 +2253,20 @@ function QuotesScreen({
   onDelete: (quoteId: string) => void;
   isPrivacyMode: boolean;
 }) {
+  const [expandedQuoteIds, setExpandedQuoteIds] = useState<Record<string, boolean>>({});
+  const sortedQuotes = [...quotes].sort((a, b) =>
+    a.name.localeCompare(b.name, "pt-BR", { sensitivity: "base" })
+  );
+
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <Text style={styles.pageTitle}>Orçamentos</Text>
-      {quotes.map((q) => {
+      <Pressable style={styles.primaryButtonFixed} onPress={onCreate}>
+        <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+          Adicionar novo orçamento
+        </Text>
+      </Pressable>
+      {sortedQuotes.map((q) => {
         const totals = computeQuoteDisplayTotals({
           quote: q,
           filaments,
@@ -2168,46 +2291,60 @@ function QuotesScreen({
         });
         const contributionCents = contribution.contribution_margin_cents;
         const contributionBps = contribution.contribution_margin_bps;
+        const isExpanded = Boolean(expandedQuoteIds[q.id]);
+        const unitsProduced = Math.max(1, q.unitsProduced || 1);
         return (
-          <View key={q.id} style={styles.card}>
-            <Text style={styles.cardTitle}>{maskSensitiveText(q.name, isPrivacyMode, PRIVACY_MASK)}</Text>
-            <Text style={styles.text}>Tempo impressao: {q.printTimeMin} min</Text>
-            <Text style={styles.text}>Tempo pós-produção: {q.postProcessingMin} min</Text>
-            <Text style={styles.text}>Unidades: {Math.max(1, q.unitsProduced || 1)}</Text>
-            <Text style={styles.text}>Custo producao (un): {money(totals.subtotalUnitCents)}</Text>
-            <Text style={styles.text}>Custo producao (lote): {money(totals.subtotalBatchCents)}</Text>
-            <Text style={styles.text}>Custo sem payback/imp. (un): {money(noPaybackNoTax.totalUnitCents)}</Text>
-            <Text style={styles.text}>Custo sem payback/imp. (lote): {money(noPaybackNoTax.totalBatchCents)}</Text>
-            <Text style={styles.text}>Preco venda (un): {money(totals.finalUnitCents)}</Text>
-            <Text style={styles.text}>Preco venda (lote): {money(totals.finalBatchCents)}</Text>
-            <Text style={styles.text}>
-              Margem contribuição (un): {money(contributionCents)} ({percentFromBps(contributionBps)}%)
-            </Text>
-            <View style={styles.row}>
-              <Pressable style={styles.smallButton} onPress={() => onEdit(q.id)}>
-                <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
-                  Editar
+          <Pressable
+            key={q.id}
+            style={styles.marketplaceCompactOrderCard}
+            onPress={() => setExpandedQuoteIds((prev) => ({ ...prev, [q.id]: !isExpanded }))}
+          >
+            <View style={styles.marketplaceCompactOrderHeader}>
+              <View style={styles.marketplaceCompactOrderBuyer}>
+                <Text style={styles.cardTitle}>{maskSensitiveText(q.name, isPrivacyMode, PRIVACY_MASK)}</Text>
+                <Text style={styles.text}>
+                  {q.printTimeMin} min impressão | {q.postProcessingMin} min pós | {unitsProduced} un.
                 </Text>
-              </Pressable>
-              <Pressable style={styles.smallButton} onPress={() => onView(q.id)}>
-                <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
-                  Ver orçamento
-                </Text>
-              </Pressable>
-              <Pressable style={styles.dangerButton} onPress={() => onDelete(q.id)}>
-                <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
-                  Excluir
-                </Text>
-              </Pressable>
+              </View>
+              <View style={styles.marketplaceCompactOrderNumbers}>
+                <Text style={styles.marketplaceOrderRevenue}>{money(totals.finalUnitCents)}</Text>
+                <Text style={styles.marketplaceMetricPrevious}>Preço un.</Text>
+              </View>
             </View>
-          </View>
+
+            {isExpanded ? (
+              <View style={styles.marketplaceOrderDetails}>
+                <Text style={styles.text}>Custo produção (un): {money(totals.subtotalUnitCents)}</Text>
+                <Text style={styles.text}>Custo produção (lote): {money(totals.subtotalBatchCents)}</Text>
+                <Text style={styles.text}>Custo sem payback/imp. (un): {money(noPaybackNoTax.totalUnitCents)}</Text>
+                <Text style={styles.text}>Custo sem payback/imp. (lote): {money(noPaybackNoTax.totalBatchCents)}</Text>
+                <Text style={styles.text}>Preço venda (un): {money(totals.finalUnitCents)}</Text>
+                <Text style={styles.text}>Preço venda (lote): {money(totals.finalBatchCents)}</Text>
+                <Text style={styles.text}>
+                  Margem contribuição (un): {money(contributionCents)} ({percentFromBps(contributionBps)}%)
+                </Text>
+                <View style={styles.row}>
+                  <Pressable style={styles.smallButton} onPress={() => onEdit(q.id)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                      Editar
+                    </Text>
+                  </Pressable>
+                  <Pressable style={styles.smallButton} onPress={() => onView(q.id)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                      Ver orçamento
+                    </Text>
+                  </Pressable>
+                  <Pressable style={styles.dangerButton} onPress={() => onDelete(q.id)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
+                      Excluir
+                    </Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : null}
+          </Pressable>
         );
       })}
-      <Pressable style={styles.primaryButtonFixed} onPress={onCreate}>
-        <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
-          Adicionar novo orçamento
-        </Text>
-      </Pressable>
     </ScrollView>
   );
 }
@@ -3177,22 +3314,47 @@ function QuoteFormScreen({
 
 function SalesSkusScreen({
   skus,
+  stock,
   onCreate,
   onEdit,
   onDelete,
   isPrivacyMode,
 }: {
   skus: SalesSku[];
+  stock: SalesStockOverview[];
   onCreate: () => void;
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
   isPrivacyMode: boolean;
 }) {
+  const [expandedSkuIds, setExpandedSkuIds] = useState<Record<string, boolean>>({});
+  const stockBySku = useMemo(() => {
+    const map = new Map<string, SalesStockOverview>();
+    for (const item of stock) {
+      map.set(item.skuId, item);
+    }
+    return map;
+  }, [stock]);
+  const sortedSkus = useMemo(
+    () =>
+      [...skus].sort((a, b) =>
+        (a.name || a.skuCode).localeCompare(b.name || b.skuCode, "pt-BR", { sensitivity: "base" })
+      ),
+    [skus]
+  );
+
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <Text style={styles.pageTitle}>SKUs</Text>
       <Text style={styles.pageSubtitle}>Cadastro de produtos para vendas em consignação</Text>
-      {skus.map((sku) => {
+      <Pressable style={styles.primaryButtonFixed} onPress={onCreate}>
+        <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+          Novo SKU
+        </Text>
+      </Pressable>
+      {sortedSkus.map((sku) => {
+        const isExpanded = Boolean(expandedSkuIds[sku.id]);
+        const stockRow = stockBySku.get(sku.id);
         const estimatedTaxCents = sku.estimatedTaxCents ?? 0;
         const contribution = computeContributionMargin({
           revenueCents: sku.defaultSalePriceCents,
@@ -3201,59 +3363,105 @@ function SalesSkusScreen({
         });
         const contributionCents = contribution.contribution_margin_cents;
         const contributionBps = contribution.contribution_margin_bps;
+        const priceWarnings = [
+          sku.defaultSalePriceCents < sku.suggestedFinalPriceCents,
+          sku.presentialSalePriceCents < sku.suggestedPresentialPriceCents,
+          sku.wholesaleConsignmentPriceCents < sku.suggestedWholesaleConsignmentPriceCents,
+          sku.wholesaleCashPriceCents < sku.suggestedWholesaleCashPriceCents,
+        ];
+        const hasPriceWarning = priceWarnings.some(Boolean);
 
         return (
-          <View key={sku.id} style={styles.card}>
-          <Text style={styles.cardTitle}>
-            {maskNameKeepCode(sku.skuCode, sku.name, isPrivacyMode)}
-          </Text>
-          {sku.parentSkuName ? (
-            <Text style={styles.text}>Derivado de: {maskSensitiveText(sku.parentSkuName, isPrivacyMode, PRIVACY_MASK)}</Text>
-          ) : null}
-          {sku.sourceQuoteName ? (
-            <Text style={styles.text}>Orçamento base: {maskSensitiveText(sku.sourceQuoteName, isPrivacyMode, PRIVACY_MASK)}</Text>
-          ) : null}
-          <Text style={styles.text}>
-            Sync preço com orçamento: {sku.syncWithQuotePricing ? "Ativo" : "Inativo"}
-          </Text>
-          {sku.barcodes.length > 0 ? (
-            <Text style={styles.text}>
-              Códigos de barras: {sku.barcodes.map((barcode) => maskSensitiveText(barcode, isPrivacyMode, PRIVACY_MASK)).join(", ")}
-            </Text>
-          ) : null}
-          <Text style={styles.text}>Preco padrão: {money(sku.defaultSalePriceCents)}</Text>
-          <Text style={styles.text}>Custo produção: {money(sku.productionCostCents)}</Text>
-          <Text style={styles.text}>Imposto estimado: {money(estimatedTaxCents)}</Text>
-          <Text style={styles.text}>
-            Margem contribuição: {money(contributionCents)} ({percentFromBps(contributionBps)}%)
-          </Text>
-          <Text style={styles.text}>Sugestão venda final: {money(sku.suggestedFinalPriceCents)}</Text>
-          <Text style={styles.text}>Sugestão presencial: {money(sku.suggestedPresentialPriceCents)}</Text>
-          <Text style={styles.text}>
-            Sugestão atacado consignado: {money(sku.suggestedWholesaleConsignmentPriceCents)}
-          </Text>
-          <Text style={styles.text}>Sugestão atacado a vista: {money(sku.suggestedWholesaleCashPriceCents)}</Text>
-          {sku.description ? <Text style={styles.text}>Descrição: {sku.description}</Text> : null}
-          <View style={styles.row}>
-            <Pressable style={styles.smallButton} onPress={() => onEdit(sku.id)}>
-              <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
-                Editar
-              </Text>
-            </Pressable>
-            <Pressable style={styles.dangerButton} onPress={() => onDelete(sku.id)}>
-              <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
-                Excluir
-              </Text>
-            </Pressable>
-          </View>
-        </View>
+          <Pressable
+            key={sku.id}
+            style={[styles.marketplaceCompactOrderCard, hasPriceWarning && styles.skuPriceWarningCard]}
+            onPress={() => setExpandedSkuIds((prev) => ({ ...prev, [sku.id]: !isExpanded }))}
+          >
+            <View style={styles.marketplaceCompactOrderHeader}>
+              <View style={styles.marketplaceCompactOrderBuyer}>
+                <Text style={styles.cardTitle}>{maskNameOrCode(sku.name, sku.skuCode, isPrivacyMode)}</Text>
+                <Text style={styles.text}>Estoque disponível: {stockRow?.availableQuantity ?? 0}</Text>
+                {hasPriceWarning ? (
+                  <Text style={styles.skuPriceWarningText}>Preço abaixo da sugestão</Text>
+                ) : null}
+              </View>
+              <View style={styles.marketplaceCompactOrderNumbers}>
+                <Text style={styles.marketplaceOrderRevenue}>{money(sku.defaultSalePriceCents)}</Text>
+                <Text style={styles.marketplaceMetricPrevious}>Preço final</Text>
+              </View>
+            </View>
+
+            {isExpanded ? (
+              <View style={styles.marketplaceOrderDetails}>
+                {sku.parentSkuName ? (
+                  <Text style={styles.text}>
+                    Derivado de: {maskSensitiveText(sku.parentSkuName, isPrivacyMode, PRIVACY_MASK)}
+                  </Text>
+                ) : null}
+                {sku.sourceQuoteName ? (
+                  <Text style={styles.text}>
+                    Orçamento base: {maskSensitiveText(sku.sourceQuoteName, isPrivacyMode, PRIVACY_MASK)}
+                  </Text>
+                ) : null}
+                <Text style={styles.text}>Sync preço com orçamento: {sku.syncWithQuotePricing ? "Ativo" : "Inativo"}</Text>
+                {sku.barcodes.length > 0 ? (
+                  <Text style={styles.text}>
+                    Códigos de barras:{" "}
+                    {sku.barcodes.map((barcode) => maskSensitiveText(barcode, isPrivacyMode, PRIVACY_MASK)).join(", ")}
+                  </Text>
+                ) : null}
+                <Text style={styles.text}>Preço final: {money(sku.defaultSalePriceCents)}</Text>
+                <Text style={sku.defaultSalePriceCents < sku.suggestedFinalPriceCents ? styles.skuPriceWarningText : styles.text}>
+                  Preço final sugerido: {money(sku.suggestedFinalPriceCents)}
+                </Text>
+                <Text style={styles.text}>Preço presencial: {money(sku.presentialSalePriceCents)}</Text>
+                <Text style={sku.presentialSalePriceCents < sku.suggestedPresentialPriceCents ? styles.skuPriceWarningText : styles.text}>
+                  Preço presencial sugerido: {money(sku.suggestedPresentialPriceCents)}
+                </Text>
+                <Text style={styles.text}>Preço atacado consignado: {money(sku.wholesaleConsignmentPriceCents)}</Text>
+                <Text
+                  style={
+                    sku.wholesaleConsignmentPriceCents < sku.suggestedWholesaleConsignmentPriceCents
+                      ? styles.skuPriceWarningText
+                      : styles.text
+                  }
+                >
+                  Preço atacado consignado sugerido: {money(sku.suggestedWholesaleConsignmentPriceCents)}
+                </Text>
+                <Text style={styles.text}>Preço atacado à vista: {money(sku.wholesaleCashPriceCents)}</Text>
+                <Text
+                  style={
+                    sku.wholesaleCashPriceCents < sku.suggestedWholesaleCashPriceCents
+                      ? styles.skuPriceWarningText
+                      : styles.text
+                  }
+                >
+                  Preço atacado à vista sugerido: {money(sku.suggestedWholesaleCashPriceCents)}
+                </Text>
+                <Text style={styles.text}>Custo produção: {money(sku.productionCostCents)}</Text>
+                <Text style={styles.text}>Imposto estimado: {money(estimatedTaxCents)}</Text>
+                <Text style={styles.text}>
+                  Margem contribuição: {money(contributionCents)} ({percentFromBps(contributionBps)}%)
+                </Text>
+                <Text style={styles.text}>Consignado em pontos: {stockRow?.consignedAtPoints.length ?? 0}</Text>
+                {sku.description ? <Text style={styles.text}>Descrição: {sku.description}</Text> : null}
+                <View style={styles.row}>
+                  <Pressable style={styles.smallButton} onPress={() => onEdit(sku.id)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                      Editar
+                    </Text>
+                  </Pressable>
+                  <Pressable style={styles.dangerButton} onPress={() => onDelete(sku.id)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.dangerButtonText}>
+                      Excluir
+                    </Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : null}
+          </Pressable>
         );
       })}
-      <Pressable style={styles.primaryButtonFixed} onPress={onCreate}>
-        <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
-          Novo SKU
-        </Text>
-      </Pressable>
     </ScrollView>
   );
 }
@@ -3296,14 +3504,17 @@ function SalesSkuFormScreen({
   const [finalSalePrice, setFinalSalePrice] = useState(
     initialData ? String(initialData.defaultSalePriceCents / 100) : ""
   );
+  const [presentialSalePrice, setPresentialSalePrice] = useState(
+    initialData ? String(initialData.presentialSalePriceCents / 100) : ""
+  );
   const [productionCost, setProductionCost] = useState(
     initialData ? String(initialData.productionCostCents / 100) : ""
   );
   const [wholesaleConsignmentPrice, setWholesaleConsignmentPrice] = useState(
-    initialData ? String(initialData.suggestedWholesaleConsignmentPriceCents / 100) : ""
+    initialData ? String(initialData.wholesaleConsignmentPriceCents / 100) : ""
   );
   const [wholesaleCashPrice, setWholesaleCashPrice] = useState(
-    initialData ? String(initialData.suggestedWholesaleCashPriceCents / 100) : ""
+    initialData ? String(initialData.wholesaleCashPriceCents / 100) : ""
   );
   const [parentSkuId, setParentSkuId] = useState(initialData?.parentSkuId ?? "");
   const [isParentSkuOpen, setIsParentSkuOpen] = useState(false);
@@ -3314,6 +3525,18 @@ function SalesSkuFormScreen({
   const [copyFromQuote, setCopyFromQuote] = useState(Boolean(initialData?.sourceQuoteId));
   const [copyMediaFromQuote, setCopyMediaFromQuote] = useState(Boolean(initialData?.sourceQuoteId));
   const [syncWithQuotePricing, setSyncWithQuotePricing] = useState(initialData?.syncWithQuotePricing ?? false);
+  const [syncFinalSalePriceWithSuggested, setSyncFinalSalePriceWithSuggested] = useState(
+    initialData?.syncFinalSalePriceWithSuggested ?? true
+  );
+  const [syncPresentialSalePriceWithSuggested, setSyncPresentialSalePriceWithSuggested] = useState(
+    initialData?.syncPresentialSalePriceWithSuggested ?? true
+  );
+  const [syncWholesaleConsignmentPriceWithSuggested, setSyncWholesaleConsignmentPriceWithSuggested] = useState(
+    initialData?.syncWholesaleConsignmentPriceWithSuggested ?? true
+  );
+  const [syncWholesaleCashPriceWithSuggested, setSyncWholesaleCashPriceWithSuggested] = useState(
+    initialData?.syncWholesaleCashPriceWithSuggested ?? true
+  );
   const [media3mfList, setMedia3mfList] = useState<string[]>(initialData?.media3mf ?? []);
   const [mediaPhotos, setMediaPhotos] = useState<string[]>(initialData?.mediaPhotos ?? []);
   const [mediaVideos, setMediaVideos] = useState<string[]>(initialData?.mediaVideos ?? []);
@@ -3327,17 +3550,20 @@ function SalesSkuFormScreen({
     setName(initialData?.name ?? "");
     setDescription(initialData?.description ?? "");
     setFinalSalePrice(initialData ? String(initialData.defaultSalePriceCents / 100) : "");
+    setPresentialSalePrice(initialData ? String(initialData.presentialSalePriceCents / 100) : "");
     setProductionCost(initialData ? String(initialData.productionCostCents / 100) : "");
-    setWholesaleConsignmentPrice(
-      initialData ? String(initialData.suggestedWholesaleConsignmentPriceCents / 100) : ""
-    );
-    setWholesaleCashPrice(initialData ? String(initialData.suggestedWholesaleCashPriceCents / 100) : "");
+    setWholesaleConsignmentPrice(initialData ? String(initialData.wholesaleConsignmentPriceCents / 100) : "");
+    setWholesaleCashPrice(initialData ? String(initialData.wholesaleCashPriceCents / 100) : "");
     setParentSkuId(initialData?.parentSkuId ?? "");
     setLinkedQuoteId(initialData?.sourceQuoteId ?? "");
     setCopyQuoteId(initialData?.sourceQuoteId ?? "");
     setCopyFromQuote(Boolean(initialData?.sourceQuoteId));
     setCopyMediaFromQuote(Boolean(initialData?.sourceQuoteId));
     setSyncWithQuotePricing(initialData?.syncWithQuotePricing ?? false);
+    setSyncFinalSalePriceWithSuggested(initialData?.syncFinalSalePriceWithSuggested ?? true);
+    setSyncPresentialSalePriceWithSuggested(initialData?.syncPresentialSalePriceWithSuggested ?? true);
+    setSyncWholesaleConsignmentPriceWithSuggested(initialData?.syncWholesaleConsignmentPriceWithSuggested ?? true);
+    setSyncWholesaleCashPriceWithSuggested(initialData?.syncWholesaleCashPriceWithSuggested ?? true);
     setMedia3mfList(initialData?.media3mf ?? []);
     setMediaPhotos(initialData?.mediaPhotos ?? []);
     setMediaVideos(initialData?.mediaVideos ?? []);
@@ -3445,6 +3671,13 @@ function SalesSkuFormScreen({
             ? prev
             : String((resolvedQuote.salePriceCents ?? 0) / 100)
       );
+      setPresentialSalePrice((prev) =>
+        mode === "overwrite"
+          ? String((resolvedQuote.salePriceCents ?? 0) / 100)
+          : prev.trim()
+            ? prev
+            : String((resolvedQuote.salePriceCents ?? 0) / 100)
+      );
       setProductionCost((prev) =>
         mode === "overwrite"
           ? String((resolvedQuote.productionCostCents ?? 0) / 100)
@@ -3514,6 +3747,7 @@ function SalesSkuFormScreen({
 
   const handleSave = () => {
     const parsedDefaultPrice = Math.round(parseLocaleNumber(finalSalePrice) * 100);
+    const parsedPresentialPrice = Math.round(parseLocaleNumber(presentialSalePrice) * 100);
     const parsedProductionCost = Math.round(parseLocaleNumber(productionCost) * 100);
     const parsedWholesaleConsignmentPrice = Math.round(parseLocaleNumber(wholesaleConsignmentPrice) * 100);
     const parsedWholesaleCashPrice = Math.round(parseLocaleNumber(wholesaleCashPrice) * 100);
@@ -3523,13 +3757,15 @@ function SalesSkuFormScreen({
     if (
       (!name.trim() && !copyFromQuote) ||
       (!Number.isFinite(parsedDefaultPrice) && !suggestSalePriceFromQuote) ||
+      (!Number.isFinite(parsedPresentialPrice) && !syncPresentialSalePriceWithSuggested) ||
       (!Number.isFinite(parsedProductionCost) && !suggestProductionCostFromQuote) ||
-      (!Number.isFinite(parsedWholesaleConsignmentPrice) && !syncWithQuotePricing) ||
-      (!Number.isFinite(parsedWholesaleCashPrice) && !syncWithQuotePricing) ||
+      (!Number.isFinite(parsedWholesaleConsignmentPrice) && !syncWholesaleConsignmentPriceWithSuggested) ||
+      (!Number.isFinite(parsedWholesaleCashPrice) && !syncWholesaleCashPriceWithSuggested) ||
       (!suggestSalePriceFromQuote && parsedDefaultPrice < 0) ||
+      (!syncPresentialSalePriceWithSuggested && parsedPresentialPrice < 0) ||
       (!suggestProductionCostFromQuote && parsedProductionCost < 0) ||
-      (!syncWithQuotePricing && parsedWholesaleConsignmentPrice < 0) ||
-      (!syncWithQuotePricing && parsedWholesaleCashPrice < 0)
+      (!syncWholesaleConsignmentPriceWithSuggested && parsedWholesaleConsignmentPrice < 0) ||
+      (!syncWholesaleCashPriceWithSuggested && parsedWholesaleCashPrice < 0)
     ) {
       setFormError("Preencha nome (ou habilite cópia do orçamento).");
       return;
@@ -3544,10 +3780,19 @@ function SalesSkuFormScreen({
         name: name.trim(),
         description: description.trim(),
         defaultSalePriceCents: Number.isFinite(parsedDefaultPrice) ? parsedDefaultPrice : 0,
+        presentialSalePriceCents: Number.isFinite(parsedPresentialPrice) ? parsedPresentialPrice : 0,
+        wholesaleConsignmentPriceCents: Number.isFinite(parsedWholesaleConsignmentPrice)
+          ? parsedWholesaleConsignmentPrice
+          : 0,
+        wholesaleCashPriceCents: Number.isFinite(parsedWholesaleCashPrice) ? parsedWholesaleCashPrice : 0,
         productionCostCents: Number.isFinite(parsedProductionCost) ? parsedProductionCost : 0,
         syncWithQuotePricing,
+        syncFinalSalePriceWithSuggested,
+        syncPresentialSalePriceWithSuggested,
+        syncWholesaleConsignmentPriceWithSuggested,
+        syncWholesaleCashPriceWithSuggested,
         suggestedFinalPriceCents: Number.isFinite(parsedDefaultPrice) ? parsedDefaultPrice : 0,
-        suggestedPresentialPriceCents: initialData?.suggestedPresentialPriceCents ?? 0,
+        suggestedPresentialPriceCents: Number.isFinite(parsedPresentialPrice) ? parsedPresentialPrice : 0,
         suggestedWholesaleConsignmentPriceCents: Number.isFinite(parsedWholesaleConsignmentPrice)
           ? parsedWholesaleConsignmentPrice
           : 0,
@@ -3742,22 +3987,61 @@ function SalesSkuFormScreen({
         value={finalSalePrice}
         onChangeText={setFinalSalePrice}
         keyboardType="numeric"
-        editable={!syncWithQuotePricing}
+        editable={!syncFinalSalePriceWithSuggested}
       />
+      <Pressable
+        style={syncFinalSalePriceWithSuggested ? styles.smallButton : styles.secondaryButton}
+        onPress={() => setSyncFinalSalePriceWithSuggested((prev) => !prev)}
+      >
+        <Text style={syncFinalSalePriceWithSuggested ? styles.smallButtonText : styles.secondaryButtonText}>
+          {syncFinalSalePriceWithSuggested ? "Preço final igual ao sugerido" : "Preço final manual"}
+        </Text>
+      </Pressable>
+      <Field
+        label="Preço venda presencial (R$)"
+        value={presentialSalePrice}
+        onChangeText={setPresentialSalePrice}
+        keyboardType="numeric"
+        editable={!syncPresentialSalePriceWithSuggested}
+      />
+      <Pressable
+        style={syncPresentialSalePriceWithSuggested ? styles.smallButton : styles.secondaryButton}
+        onPress={() => setSyncPresentialSalePriceWithSuggested((prev) => !prev)}
+      >
+        <Text style={syncPresentialSalePriceWithSuggested ? styles.smallButtonText : styles.secondaryButtonText}>
+          {syncPresentialSalePriceWithSuggested ? "Preço presencial igual ao sugerido" : "Preço presencial manual"}
+        </Text>
+      </Pressable>
       <Field
         label="Preço venda atacado consignado (R$)"
         value={wholesaleConsignmentPrice}
         onChangeText={setWholesaleConsignmentPrice}
         keyboardType="numeric"
-        editable={!syncWithQuotePricing}
+        editable={!syncWholesaleConsignmentPriceWithSuggested}
       />
+      <Pressable
+        style={syncWholesaleConsignmentPriceWithSuggested ? styles.smallButton : styles.secondaryButton}
+        onPress={() => setSyncWholesaleConsignmentPriceWithSuggested((prev) => !prev)}
+      >
+        <Text style={syncWholesaleConsignmentPriceWithSuggested ? styles.smallButtonText : styles.secondaryButtonText}>
+          {syncWholesaleConsignmentPriceWithSuggested ? "Consignado igual ao sugerido" : "Consignado manual"}
+        </Text>
+      </Pressable>
       <Field
         label="Preço venda atacado a vista (R$)"
         value={wholesaleCashPrice}
         onChangeText={setWholesaleCashPrice}
         keyboardType="numeric"
-        editable={!syncWithQuotePricing}
+        editable={!syncWholesaleCashPriceWithSuggested}
       />
+      <Pressable
+        style={syncWholesaleCashPriceWithSuggested ? styles.smallButton : styles.secondaryButton}
+        onPress={() => setSyncWholesaleCashPriceWithSuggested((prev) => !prev)}
+      >
+        <Text style={syncWholesaleCashPriceWithSuggested ? styles.smallButtonText : styles.secondaryButtonText}>
+          {syncWholesaleCashPriceWithSuggested ? "Atacado à vista igual ao sugerido" : "Atacado à vista manual"}
+        </Text>
+      </Pressable>
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Mídias do SKU</Text>
@@ -4392,6 +4676,150 @@ function SalesStockScreen({
   );
 }
 
+function ConsignmentDashboardPanel({
+  dashboard,
+  points,
+  onFetchDashboard,
+  isPrivacyMode,
+}: {
+  dashboard: ConsignmentDashboard | null;
+  points: SalesPoint[];
+  onFetchDashboard: (filters: { dateFrom: string; dateTo: string; salesPointId: string }) => Promise<void>;
+  isPrivacyMode: boolean;
+}) {
+  const [dashboardDateFrom, setDashboardDateFrom] = useState("");
+  const [dashboardDateTo, setDashboardDateTo] = useState("");
+  const [dashboardPointId, setDashboardPointId] = useState("");
+  const [isDashboardPointOpen, setIsDashboardPointOpen] = useState(false);
+  const [isDashboardLoading, setIsDashboardLoading] = useState(false);
+  const [dashboardError, setDashboardError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        setIsDashboardLoading(true);
+        setDashboardError(null);
+        await onFetchDashboard({ dateFrom: dashboardDateFrom, dateTo: dashboardDateTo, salesPointId: dashboardPointId });
+      } catch (error: any) {
+        setDashboardError(error?.message ?? "Falha ao carregar dashboard de consignação.");
+      } finally {
+        setIsDashboardLoading(false);
+      }
+    })();
+  }, []);
+
+  const selectedDashboardPointName =
+    dashboardPointId
+      ? maskSensitiveText(points.find((item) => item.id === dashboardPointId)?.name ?? "", isPrivacyMode)
+      : "";
+  const movementLabelMap: Record<ConsignmentDashboardMovement["movementType"], string> = {
+    sent: "Envio",
+    sold: "Venda",
+    returned: "Devolução",
+  };
+  const refreshDashboard = async () => {
+    setIsDashboardLoading(true);
+    setDashboardError(null);
+    try {
+      await onFetchDashboard({ dateFrom: dashboardDateFrom, dateTo: dashboardDateTo, salesPointId: dashboardPointId });
+    } catch (error: any) {
+      setDashboardError(error?.message ?? "Falha ao carregar dashboard de consignação.");
+    } finally {
+      setIsDashboardLoading(false);
+    }
+  };
+  const clearDashboardFilters = async () => {
+    setDashboardDateFrom("");
+    setDashboardDateTo("");
+    setDashboardPointId("");
+    setIsDashboardLoading(true);
+    setDashboardError(null);
+    try {
+      await onFetchDashboard({ dateFrom: "", dateTo: "", salesPointId: "" });
+    } catch (error: any) {
+      setDashboardError(error?.message ?? "Falha ao carregar dashboard de consignação.");
+    } finally {
+      setIsDashboardLoading(false);
+    }
+  };
+
+  return (
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>Dashboard</Text>
+      <View style={styles.metricGrid}>
+        <View style={styles.metricCard}>
+          <Text style={styles.metricLabel}>Itens vendidos</Text>
+          <Text style={styles.metricValue}>{dashboard?.totals.soldItemsCount ?? 0}</Text>
+        </View>
+        <View style={styles.metricCard}>
+          <Text style={styles.metricLabel}>Itens disponíveis</Text>
+          <Text style={styles.metricValue}>{dashboard?.totals.availableItemsCount ?? 0}</Text>
+        </View>
+        <View style={styles.metricCard}>
+          <Text style={styles.metricLabel}>Pontos ativos</Text>
+          <Text style={styles.metricValue}>{dashboard?.totals.activeSalesPointsCount ?? 0}</Text>
+        </View>
+      </View>
+      <View style={styles.row}>
+        <View style={styles.filterField}>
+          <Field label="Data inicial" value={dashboardDateFrom} onChangeText={setDashboardDateFrom} />
+        </View>
+        <View style={styles.filterField}>
+          <Field label="Data final" value={dashboardDateTo} onChangeText={setDashboardDateTo} />
+        </View>
+      </View>
+      <SelectField
+        label="Ponto de consignação"
+        value={selectedDashboardPointName}
+        placeholder="Todos os pontos"
+        options={points.map((item) => ({
+          value: item.id,
+          label: maskSensitiveText(item.name, isPrivacyMode, PRIVACY_MASK),
+        }))}
+        isOpen={isDashboardPointOpen}
+        emptyText="Cadastre pontos de venda primeiro."
+        onToggle={() => setIsDashboardPointOpen((prev) => !prev)}
+        onSelect={(value) => {
+          const point = points.find((item) => item.id === value);
+          if (!point) return;
+          setDashboardPointId(point.id);
+          setIsDashboardPointOpen(false);
+        }}
+      />
+      <View style={styles.row}>
+        <Pressable style={styles.smallButton} onPress={() => void refreshDashboard()}>
+          <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+            Aplicar filtros
+          </Text>
+        </Pressable>
+        <Pressable style={styles.secondaryButton} onPress={() => void clearDashboardFilters()}>
+          <Text allowFontScaling={false} numberOfLines={1} style={styles.secondaryButtonText}>
+            Limpar filtros
+          </Text>
+        </Pressable>
+      </View>
+      {isDashboardLoading ? <Text style={styles.text}>Carregando dashboard...</Text> : null}
+      {dashboardError ? <Text style={styles.errorText}>{dashboardError}</Text> : null}
+      <Text style={styles.cardTitle}>Movimentações recentes</Text>
+      {!isDashboardLoading && (dashboard?.movements.length ?? 0) === 0 ? (
+        <Text style={styles.text}>Sem movimentações no período.</Text>
+      ) : null}
+      {(dashboard?.movements ?? []).map((movement, index) => (
+        <View key={`${movement.movementType}-${movement.batchItemId}-${movement.eventAt}-${index}`} style={styles.dashboardMovementRow}>
+          <Text numberOfLines={1} ellipsizeMode="tail" style={styles.dashboardMovementMainText}>
+            {movementLabelMap[movement.movementType]} | {maskSensitiveComposite([movement.skuCode, movement.skuName], isPrivacyMode, PRIVACY_MASK)}
+          </Text>
+          <Text style={styles.dashboardMovementMetaText}>Qtd: {movement.quantity}</Text>
+          <Text style={styles.dashboardMovementMetaText}>{dateOnly(movement.eventAt)}</Text>
+          <Text numberOfLines={1} ellipsizeMode="tail" style={styles.dashboardMovementPointText}>
+            {maskSensitiveText(movement.salesPointName, isPrivacyMode, PRIVACY_MASK)}
+          </Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
 function SalesConsignmentScreen({
   skus,
   points,
@@ -4737,11 +5165,36 @@ function SalesConsignmentScreen({
 
 function SalesPointsOverviewScreen({
   overview,
+  dashboard,
+  skus,
+  points,
+  onFetchDashboard,
+  onCreateConsignmentBatch,
+  onRegisterPointSale,
+  onRegisterPointReturn,
   onMarkContactToday,
   onSetNextContact,
   isPrivacyMode,
 }: {
   overview: SalesPointOverview[];
+  dashboard: ConsignmentDashboard | null;
+  skus: SalesSku[];
+  points: SalesPoint[];
+  onFetchDashboard: (filters: { dateFrom: string; dateTo: string; salesPointId: string }) => Promise<void>;
+  onCreateConsignmentBatch: (payload: {
+    salesPointId: string;
+    dispatchedAt: string;
+    notes: string;
+    items: Array<{ skuId: string; quantitySent: number; unitSalePriceCents: number }>;
+  }) => void;
+  onRegisterPointSale: (salesPointId: string, skuId: string, soldQuantity: number, soldAt: string, notes: string) => void;
+  onRegisterPointReturn: (
+    salesPointId: string,
+    skuId: string,
+    returnedQuantity: number,
+    returnedAt: string,
+    notes: string
+  ) => void;
   onMarkContactToday: (salesPointId: string) => void;
   onSetNextContact: (salesPointId: string, nextContactDate: string) => void;
   isPrivacyMode: boolean;
@@ -4750,6 +5203,14 @@ function SalesPointsOverviewScreen({
   const [editingPointId, setEditingPointId] = useState("");
   const [nextContactDateInput, setNextContactDateInput] = useState("");
   const [calendarCursor, setCalendarCursor] = useState(new Date());
+  const [actionPointId, setActionPointId] = useState("");
+  const [actionMode, setActionMode] = useState<"" | "sale" | "return" | "send">("");
+  const [actionSkuId, setActionSkuId] = useState("");
+  const [isActionSkuOpen, setIsActionSkuOpen] = useState(false);
+  const [actionQuantity, setActionQuantity] = useState("");
+  const [actionUnitSalePrice, setActionUnitSalePrice] = useState("");
+  const [actionDate, setActionDate] = useState(() => dateOnly(new Date().toISOString()));
+  const [actionNotes, setActionNotes] = useState("");
 
   const weekDays = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sab"];
   const monthLabel = `${calendarCursor.toLocaleString("pt-BR", { month: "long" })} ${calendarCursor.getFullYear()}`;
@@ -4773,9 +5234,79 @@ function SalesPointsOverviewScreen({
     setIsModalVisible(true);
   };
 
+  const resetPointAction = () => {
+    setActionMode("");
+    setActionSkuId("");
+    setIsActionSkuOpen(false);
+    setActionQuantity("");
+    setActionUnitSalePrice("");
+    setActionDate(dateOnly(new Date().toISOString()));
+    setActionNotes("");
+  };
+
+  const openPointAction = (pointId: string) => {
+    if (actionPointId === pointId) {
+      setActionPointId("");
+      resetPointAction();
+      return;
+    }
+    setActionPointId(pointId);
+    resetPointAction();
+  };
+
+  const selectActionMode = (mode: "sale" | "return" | "send", point: SalesPointOverview) => {
+    setActionMode(mode);
+    setIsActionSkuOpen(false);
+    setActionQuantity("");
+    setActionNotes("");
+    setActionDate(dateOnly(new Date().toISOString()));
+    const firstSkuId = mode === "send" ? skus[0]?.id ?? "" : point.productsAtPoint[0]?.skuId ?? "";
+    setActionSkuId(firstSkuId);
+    const selectedSku = skus.find((item) => item.id === firstSkuId);
+    setActionUnitSalePrice(
+      mode === "send" && selectedSku ? String(selectedSku.suggestedWholesaleConsignmentPriceCents / 100) : ""
+    );
+  };
+
+  const submitPointAction = (point: SalesPointOverview) => {
+    const qty = Math.round(parseLocaleNumber(actionQuantity));
+    if (!actionMode || !actionSkuId || !Number.isFinite(qty) || qty <= 0) return;
+
+    if (actionMode === "sale") {
+      onRegisterPointSale(point.salesPointId, actionSkuId, qty, actionDate.trim(), actionNotes.trim());
+      resetPointAction();
+      setActionPointId("");
+      return;
+    }
+
+    if (actionMode === "return") {
+      onRegisterPointReturn(point.salesPointId, actionSkuId, qty, actionDate.trim(), actionNotes.trim());
+      resetPointAction();
+      setActionPointId("");
+      return;
+    }
+
+    const unitCents = Math.round(parseLocaleNumber(actionUnitSalePrice) * 100);
+    if (!Number.isFinite(unitCents) || unitCents < 0) return;
+    onCreateConsignmentBatch({
+      salesPointId: point.salesPointId,
+      dispatchedAt: actionDate.trim(),
+      notes: actionNotes.trim(),
+      items: [{ skuId: actionSkuId, quantitySent: qty, unitSalePriceCents: unitCents }],
+    });
+    resetPointAction();
+    setActionPointId("");
+  };
+
   return (
     <ScrollView contentContainerStyle={styles.content}>
       <Text style={styles.pageTitle}>Visão Geral dos Pontos</Text>
+      <ConsignmentDashboardPanel
+        dashboard={dashboard}
+        points={points}
+        onFetchDashboard={onFetchDashboard}
+        isPrivacyMode={isPrivacyMode}
+      />
       {overview.length === 0 && <Text style={styles.text}>Sem dados de consignação ainda.</Text>}
       {overview.map((point) => (
         <View key={point.salesPointId} style={styles.card}>
@@ -4801,7 +5332,130 @@ function SalesPointsOverviewScreen({
                 Editar próximo contato
               </Text>
             </Pressable>
+            <Pressable style={styles.primaryButtonFixed} onPress={() => openPointAction(point.salesPointId)}>
+              <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+                Registrar movimentação
+              </Text>
+            </Pressable>
           </View>
+          {actionPointId === point.salesPointId && (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Movimentação do ponto</Text>
+              <View style={styles.row}>
+                <Pressable
+                  style={[styles.smallButton, actionMode === "sale" && styles.selectedButton]}
+                  onPress={() => selectActionMode("sale", point)}
+                >
+                  <Text
+                    allowFontScaling={false}
+                    numberOfLines={1}
+                    style={[styles.smallButtonText, actionMode === "sale" && styles.selectedButtonText]}
+                  >
+                    Registrar venda
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.secondaryButton, actionMode === "return" && styles.selectedButton]}
+                  onPress={() => selectActionMode("return", point)}
+                >
+                  <Text
+                    allowFontScaling={false}
+                    numberOfLines={1}
+                    style={[styles.secondaryButtonText, actionMode === "return" && styles.selectedButtonText]}
+                  >
+                    Registrar retirada
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.secondaryButton, actionMode === "send" && styles.selectedButton]}
+                  onPress={() => selectActionMode("send", point)}
+                >
+                  <Text
+                    allowFontScaling={false}
+                    numberOfLines={1}
+                    style={[styles.secondaryButtonText, actionMode === "send" && styles.selectedButtonText]}
+                  >
+                    Registrar envio de estoque
+                  </Text>
+                </Pressable>
+              </View>
+              {actionMode ? (
+                <>
+                  <SelectField
+                    label="Produto"
+                    value={
+                      actionMode === "send"
+                        ? maskSensitiveComposite(
+                            [
+                              skus.find((item) => item.id === actionSkuId)?.skuCode ?? "",
+                              skus.find((item) => item.id === actionSkuId)?.name ?? "",
+                            ].filter(Boolean),
+                            isPrivacyMode,
+                            PRIVACY_MASK
+                          )
+                        : maskSensitiveComposite(
+                            [
+                              point.productsAtPoint.find((item) => item.skuId === actionSkuId)?.skuCode ?? "",
+                              point.productsAtPoint.find((item) => item.skuId === actionSkuId)?.skuName ?? "",
+                            ].filter(Boolean),
+                            isPrivacyMode,
+                            PRIVACY_MASK
+                          )
+                    }
+                    placeholder="Selecione um produto"
+                    options={(actionMode === "send" ? skus : point.productsAtPoint).map((item) => {
+                      const skuCode = "skuCode" in item ? item.skuCode : "";
+                      const skuName = "skuName" in item ? item.skuName : item.name;
+                      return {
+                        value: "skuId" in item ? item.skuId : item.id,
+                        label: maskSensitiveComposite([skuCode, skuName], isPrivacyMode, PRIVACY_MASK),
+                      };
+                    })}
+                    emptyText={
+                      actionMode === "send" ? "Cadastre SKUs primeiro." : "Este ponto não possui estoque disponível."
+                    }
+                    isOpen={isActionSkuOpen}
+                    onToggle={() => setIsActionSkuOpen((prev) => !prev)}
+                    onSelect={(value) => {
+                      setActionSkuId(value);
+                      setIsActionSkuOpen(false);
+                      if (actionMode === "send") {
+                        const sku = skus.find((item) => item.id === value);
+                        setActionUnitSalePrice(
+                          sku ? String(sku.suggestedWholesaleConsignmentPriceCents / 100) : actionUnitSalePrice
+                        );
+                      }
+                    }}
+                  />
+                  <Field
+                    label="Quantidade"
+                    value={actionQuantity}
+                    onChangeText={setActionQuantity}
+                    keyboardType="numeric"
+                  />
+                  {actionMode === "send" && (
+                    <Field
+                      label="Preço unitário no ponto (R$)"
+                      value={actionUnitSalePrice}
+                      onChangeText={setActionUnitSalePrice}
+                      keyboardType="numeric"
+                    />
+                  )}
+                  <Field
+                    label={actionMode === "send" ? "Data de envio" : "Data da movimentação"}
+                    value={actionDate}
+                    onChangeText={setActionDate}
+                  />
+                  <Field label="Notas" value={actionNotes} onChangeText={setActionNotes} multiline />
+                  <Pressable style={styles.primaryButtonFixed} onPress={() => submitPointAction(point)}>
+                    <Text allowFontScaling={false} numberOfLines={1} style={styles.primaryButtonText}>
+                      Salvar movimentação
+                    </Text>
+                  </Pressable>
+                </>
+              ) : null}
+            </View>
+          )}
           <Text style={styles.text}>Produtos ativos no ponto: {point.activeProductsCount}</Text>
           <Text style={styles.text}>Renda esperada: {money(point.expectedRevenueCents)}</Text>
           <Text style={styles.text}>Renda realizada: {money(point.realizedRevenueCents)}</Text>
@@ -4932,6 +5586,9 @@ function LogsScreen({
     marketplace_orders_read_finished: "Sync de vendas concluído",
     marketplace_orders_read_cancelled: "Sync de vendas interrompido",
     marketplace_orders_read_failed: "Sync de vendas falhou",
+    marketplace_product_ads_read_started: "Sync de Product Ads iniciado",
+    marketplace_product_ads_read_finished: "Sync de Product Ads concluído",
+    marketplace_product_ads_read_failed: "Sync de Product Ads falhou",
     marketplace_sync_cancel_requested: "Interrupção solicitada",
   };
   const finishedRunIds = new Set(
@@ -4948,6 +5605,17 @@ function LogsScreen({
       {logs.length === 0 && <Text style={styles.text}>Sem logs até o momento.</Text>}
       {logs.map((log) => {
         const runId = String(log.payload?.run_id ?? log.entityId ?? "");
+        const logMessage = String(log.payload?.message ?? log.payload?.reason ?? "").trim();
+        const logStatus = log.payload?.error_status ?? log.payload?.status_code;
+        const logDetails =
+          log.payload?.error_details !== undefined && log.payload?.error_details !== null
+            ? JSON.stringify(log.payload.error_details)
+            : "";
+        const syncWindow = String(log.payload?.sync_window ?? "").trim();
+        const syncMode = String(log.payload?.sync_mode ?? "").trim();
+        const recordsRead = log.payload?.records_read;
+        const recordsUpserted = log.payload?.records_upserted;
+        const recordsFailed = log.payload?.records_failed;
         const isMarketplaceSyncStart =
           log.entityType === "marketplace_sync_run" &&
           String(log.payload?.phase ?? "") === "started" &&
@@ -4958,8 +5626,22 @@ function LogsScreen({
           <View key={log.id} style={styles.card}>
             <Text style={styles.cardTitle}>{typeLabels[log.eventType] ?? log.eventType}</Text>
             <Text style={styles.text}>Resumo: {log.summary}</Text>
-            <Text style={styles.text}>Data: {dateOnly(log.createdAt)}</Text>
+            <Text style={styles.text}>Data/hora: {dateTime(log.createdAt)}</Text>
             <Text style={styles.text}>Entidade: {log.entityType}{log.entityId ? ` (${log.entityId})` : ""}</Text>
+            {logMessage ? <Text style={styles.errorText}>Mensagem: {logMessage}</Text> : null}
+            {logStatus ? <Text style={styles.errorText}>Status: {String(logStatus)}</Text> : null}
+            {logDetails ? <Text style={styles.text}>Detalhes: {logDetails}</Text> : null}
+            {syncWindow || syncMode ? (
+              <Text style={styles.text}>
+                Sincronia: {[syncWindow, syncMode].filter(Boolean).join(" | ")}
+              </Text>
+            ) : null}
+            {[recordsRead, recordsUpserted, recordsFailed].some((value) => value !== undefined && value !== null) ? (
+              <Text style={styles.text}>
+                Registros: lidos {Number(recordsRead ?? 0)}, salvos {Number(recordsUpserted ?? 0)}, falhas{" "}
+                {Number(recordsFailed ?? 0)}
+              </Text>
+            ) : null}
             {isMarketplaceSyncStart ? (
               <View style={styles.row}>
                 <Pressable
@@ -4983,7 +5665,14 @@ function LogsScreen({
 type MarketplaceOrdersComparisonMode = "previous" | "same_30_days_before";
 type MarketplaceOrdersRangeSelection = "start" | "end";
 type MarketplaceOrdersQuickRange = "today" | "yesterday" | "7d" | "15d" | "30d" | null;
-type MarketplaceOrdersMetricKey = "revenue" | "productionCost" | "ordersCount" | "averageTicket" | "unitsSold";
+type MarketplaceOrdersMetricKey =
+  | "revenue"
+  | "productionCost"
+  | "grossProfit"
+  | "ordersCount"
+  | "averageTicket"
+  | "unitsSold";
+type MarketplaceOrdersSortKey = "total_desc" | "total_asc" | "profit_desc" | "profit_asc" | "date_desc" | "date_asc";
 
 type MarketplaceOrdersSummary = {
   revenueCents: number;
@@ -5005,9 +5694,11 @@ type MarketplaceOrderSkuLinkTarget = {
 function MarketplaceOrdersDashboardSection({
   orderItems,
   accounts,
+  ordersDashboard,
   normalizationRules,
   isBusy,
   taxRatePercent,
+  onFetchOrdersDashboard,
   onRecalculateAllOrderSnapshots,
   onRecalculateSingleOrderSnapshot,
   onOpenSkuLinking,
@@ -5015,9 +5706,11 @@ function MarketplaceOrdersDashboardSection({
 }: {
   orderItems: MarketplaceOrderItem[];
   accounts: MarketplaceAccountStatus[];
+  ordersDashboard: MarketplaceOrdersDashboardResponse | null;
   normalizationRules: MarketplaceNormalizationRule[];
   isBusy: boolean;
   taxRatePercent: number;
+  onFetchOrdersDashboard: (filters: { dateFrom: string; dateTo: string }) => Promise<void>;
   onRecalculateAllOrderSnapshots: () => void;
   onRecalculateSingleOrderSnapshot: (orderId: string) => void;
   onOpenSkuLinking: (target: MarketplaceOrderSkuLinkTarget) => void;
@@ -5031,6 +5724,7 @@ function MarketplaceOrdersDashboardSection({
   const [logisticFilter, setLogisticFilter] = useState("__all__");
   const [statusFilter, setStatusFilter] = useState("__all__");
   const [hideCancelled, setHideCancelled] = useState(true);
+  const [ordersSortKey, setOrdersSortKey] = useState<MarketplaceOrdersSortKey>("date_desc");
   const [expandedOrderIds, setExpandedOrderIds] = useState<Record<string, boolean>>({});
   const [isRangeModalVisible, setIsRangeModalVisible] = useState(false);
   const [rangeSelection, setRangeSelection] = useState<MarketplaceOrdersRangeSelection>("start");
@@ -5038,6 +5732,7 @@ function MarketplaceOrdersDashboardSection({
   const [areChartsVisible, setAreChartsVisible] = useState(() =>
     readCookieBoolean(MARKETPLACE_ORDERS_CHARTS_VISIBLE_COOKIE, true)
   );
+  const [areStockStatusesVisible, setAreStockStatusesVisible] = useState(true);
   const [selectedMetricChart, setSelectedMetricChart] = useState<MarketplaceOrdersMetricKey | null>(null);
   const [hoveredMetricPoint, setHoveredMetricPoint] = useState<{
     x: number;
@@ -5101,6 +5796,13 @@ function MarketplaceOrdersDashboardSection({
     };
   }, [comparisonMode, normalizedRange]);
 
+  useEffect(() => {
+    void onFetchOrdersDashboard({
+      dateFrom: normalizedRange.startKey,
+      dateTo: normalizedRange.endKey,
+    });
+  }, [normalizedRange.startKey, normalizedRange.endKey]);
+
   const logisticOptions = useMemo(() => {
     const values = new Map<string, string>();
     for (const order of orderItems) {
@@ -5159,12 +5861,39 @@ function MarketplaceOrdersDashboardSection({
     };
   };
 
+  const orderGrossProfitCents = (order: MarketplaceOrderItem) => {
+    const baseReceived = order.metrics?.netReceivedCents ?? order.metrics?.grossRevenueCents ?? 0;
+    const productionCost = order.metrics?.productionCostCents ?? 0;
+    const estimatedTaxCents = Math.round((order.metrics?.grossRevenueCents ?? 0) * (taxRatePercent / 100));
+    return baseReceived - productionCost - estimatedTaxCents;
+  };
+
+  const orderDateTimeMs = (order: MarketplaceOrderItem) =>
+    Date.parse(order.date_created || order.updated_at || order.last_seen_at || "") || 0;
+
   const currentOrders = useMemo(
-    () =>
-      orderItems
-        .filter((order) => filterOrder(order, normalizedRange.startDate, normalizedRange.endDate))
-        .sort((a, b) => Date.parse(b.date_created || b.updated_at || "") - Date.parse(a.date_created || a.updated_at || "")),
-    [orderItems, normalizedRange, logisticFilter, statusFilter, hideCancelled]
+    () => {
+      const filtered = orderItems.filter((order) => filterOrder(order, normalizedRange.startDate, normalizedRange.endDate));
+      return filtered.sort((a, b) => {
+        if (ordersSortKey === "total_desc") {
+          return (b.metrics?.grossRevenueCents ?? 0) - (a.metrics?.grossRevenueCents ?? 0);
+        }
+        if (ordersSortKey === "total_asc") {
+          return (a.metrics?.grossRevenueCents ?? 0) - (b.metrics?.grossRevenueCents ?? 0);
+        }
+        if (ordersSortKey === "profit_desc") {
+          return orderGrossProfitCents(b) - orderGrossProfitCents(a);
+        }
+        if (ordersSortKey === "profit_asc") {
+          return orderGrossProfitCents(a) - orderGrossProfitCents(b);
+        }
+        if (ordersSortKey === "date_asc") {
+          return orderDateTimeMs(a) - orderDateTimeMs(b);
+        }
+        return orderDateTimeMs(b) - orderDateTimeMs(a);
+      });
+    },
+    [orderItems, normalizedRange, logisticFilter, statusFilter, hideCancelled, ordersSortKey, taxRatePercent]
   );
 
   const comparisonOrders = useMemo(
@@ -5174,6 +5903,8 @@ function MarketplaceOrdersDashboardSection({
 
   const currentSummary = useMemo(() => summarizeOrders(currentOrders), [currentOrders, taxRatePercent]);
   const comparisonSummary = useMemo(() => summarizeOrders(comparisonOrders), [comparisonOrders, taxRatePercent]);
+  const productAds = ordersDashboard?.product_ads ?? null;
+  const productAdsMaxCostCents = Math.max(1, ...(productAds?.daily ?? []).map((item) => item.cost_cents));
   const logisticsChartColors = ["#1e3a79", "#0f766e", "#f59e0b", "#7c3aed", "#dc2626", "#4b5563"];
   const accountsById = useMemo(() => {
     const map = new Map<string, MarketplaceAccountStatus>();
@@ -5294,6 +6025,7 @@ function MarketplaceOrdersDashboardSection({
       {
         revenueCents: number;
         productionCostCents: number;
+        grossProfitCents: number;
         ordersCount: number;
         unitsSold: number;
       }
@@ -5303,7 +6035,7 @@ function MarketplaceOrdersDashboardSection({
     const end = startOfLocalDay(endDate);
     while (cursor.getTime() <= end.getTime()) {
       const key = formatLocalDateKey(cursor);
-      buckets.set(key, { revenueCents: 0, productionCostCents: 0, ordersCount: 0, unitsSold: 0 });
+      buckets.set(key, { revenueCents: 0, productionCostCents: 0, grossProfitCents: 0, ordersCount: 0, unitsSold: 0 });
       labels.push(`${String(cursor.getDate()).padStart(2, "0")}/${String(cursor.getMonth() + 1).padStart(2, "0")}`);
       cursor = addLocalDays(cursor, 1);
     }
@@ -5316,6 +6048,7 @@ function MarketplaceOrdersDashboardSection({
       if (!bucket) continue;
       bucket.revenueCents += order.metrics?.grossRevenueCents ?? 0;
       bucket.productionCostCents += order.metrics?.productionCostCents ?? 0;
+      bucket.grossProfitCents += orderGrossProfitCents(order);
       bucket.ordersCount += 1;
       bucket.unitsSold += order.metrics?.unitsSold ?? 0;
     }
@@ -5323,6 +6056,7 @@ function MarketplaceOrdersDashboardSection({
     const values = Array.from(buckets.values()).map((bucket) => {
       if (metricKey === "revenue") return bucket.revenueCents;
       if (metricKey === "productionCost") return bucket.productionCostCents;
+      if (metricKey === "grossProfit") return bucket.grossProfitCents;
       if (metricKey === "ordersCount") return bucket.ordersCount;
       if (metricKey === "averageTicket") {
         return bucket.ordersCount > 0 ? Math.round(bucket.revenueCents / bucket.ordersCount) : 0;
@@ -5348,6 +6082,14 @@ function MarketplaceOrdersDashboardSection({
       value: money(currentSummary.productionCostCents),
       previousValue: comparisonSummary.productionCostCents,
       currentValue: currentSummary.productionCostCents,
+      formatter: money,
+    },
+    {
+      key: "grossProfit" as const,
+      label: "Lucro",
+      value: money(currentSummary.grossProfitCents),
+      previousValue: comparisonSummary.grossProfitCents,
+      currentValue: currentSummary.grossProfitCents,
       formatter: money,
     },
     {
@@ -5552,6 +6294,57 @@ function MarketplaceOrdersDashboardSection({
         ))}
       </View>
 
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Product Ads no período</Text>
+        <View style={styles.marketplaceMetricGrid}>
+          <View style={styles.marketplaceMetricCard}>
+            <Text style={styles.marketplaceMetricLabel}>Gasto Mercado Ads</Text>
+            <Text style={styles.marketplaceMetricValue}>{money(productAds?.totals.cost_cents ?? 0)}</Text>
+          </View>
+          <View style={styles.marketplaceMetricCard}>
+            <Text style={styles.marketplaceMetricLabel}>Impressões</Text>
+            <Text style={styles.marketplaceMetricValue}>{productAds?.totals.impressions ?? 0}</Text>
+          </View>
+          <View style={styles.marketplaceMetricCard}>
+            <Text style={styles.marketplaceMetricLabel}>Cliques</Text>
+            <Text style={styles.marketplaceMetricValue}>{productAds?.totals.clicks ?? 0}</Text>
+          </View>
+          <View style={styles.marketplaceMetricCard}>
+            <Text style={styles.marketplaceMetricLabel}>Compras Ads</Text>
+            <Text style={styles.marketplaceMetricValue}>{productAds?.totals.orders ?? 0}</Text>
+          </View>
+        </View>
+        {productAds?.daily?.length ? (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.productAdsChartScroll}>
+            {productAds.daily.map((item) => (
+              <View key={item.date} style={styles.productAdsBarWrap}>
+                <Text style={styles.productAdsBarValue}>{money(item.cost_cents)}</Text>
+                <View style={styles.productAdsBarTrack}>
+                  <View
+                    style={[
+                      styles.productAdsBarFill,
+                      { height: `${Math.max(4, (item.cost_cents / productAdsMaxCostCents) * 100)}%` },
+                    ]}
+                  />
+                </View>
+                <Text style={styles.productAdsBarLabel}>{item.date.slice(5)}</Text>
+              </View>
+            ))}
+          </ScrollView>
+        ) : (
+          <Text style={styles.text}>Sem dados de Product Ads para o período ou conta sem Mercado Ads habilitado.</Text>
+        )}
+        {productAds?.accounts?.some((item) => item.status !== "ok") ? (
+          <Text style={styles.marketplaceMetricPrevious}>
+            Algumas contas não retornaram Product Ads:{" "}
+            {productAds.accounts
+              .filter((item) => item.status !== "ok")
+              .map((item) => item.message ?? item.status)
+              .join(" | ")}
+          </Text>
+        ) : null}
+      </View>
+
       {selectedMetric && metricChartData ? (
         <View style={styles.card}>
           <View style={styles.marketplaceMetricChartHeader}>
@@ -5638,12 +6431,18 @@ function MarketplaceOrdersDashboardSection({
 
       <View style={styles.row}>
         <AppButton
-          label={areChartsVisible ? "-" : "+"}
+          label="Gráficos"
           variant="small"
           active={areChartsVisible}
           onPress={() => setAreChartsVisible((prev) => !prev)}
           style={styles.marketplaceChartsToggleButton}
           textStyle={styles.marketplaceChartsToggleButtonText}
+        />
+        <AppButton
+          label="Status de estoque"
+          variant="small"
+          active={areStockStatusesVisible}
+          onPress={() => setAreStockStatusesVisible((prev) => !prev)}
         />
       </View>
 
@@ -5787,7 +6586,7 @@ function MarketplaceOrdersDashboardSection({
         </View>
       </View>
 
-      <View style={styles.card}>
+      {areStockStatusesVisible && <View style={styles.card}>
         <Text style={styles.cardTitle}>Pendências de estoque marketplace</Text>
         <View style={styles.marketplaceStockStatusGrid}>
           <View style={styles.marketplaceStockStatusPill}>
@@ -5852,10 +6651,28 @@ function MarketplaceOrdersDashboardSection({
             ))}
           </View>
         )}
-      </View>
+      </View>}
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Pedidos filtrados ({currentOrders.length})</Text>
+        <View style={styles.row}>
+          {[
+            { key: "total_desc" as const, label: "Maior valor" },
+            { key: "total_asc" as const, label: "Menor valor" },
+            { key: "profit_desc" as const, label: "Maior lucro" },
+            { key: "profit_asc" as const, label: "Menor lucro" },
+            { key: "date_desc" as const, label: "Mais recente" },
+            { key: "date_asc" as const, label: "Mais antigo" },
+          ].map((option) => (
+            <AppButton
+              key={option.key}
+              label={option.label}
+              variant="small"
+              active={ordersSortKey === option.key}
+              onPress={() => setOrdersSortKey(option.key)}
+            />
+          ))}
+        </View>
         {currentOrders.length === 0 ? (
           <Text style={styles.text}>Nenhum pedido encontrado para o período e filtros atuais.</Text>
         ) : (
@@ -5864,6 +6681,9 @@ function MarketplaceOrdersDashboardSection({
             const baseReceived = order.metrics?.netReceivedCents ?? order.metrics?.grossRevenueCents ?? 0;
             const estimatedTaxCents = Math.round((order.metrics?.grossRevenueCents ?? 0) * (taxRatePercent / 100));
             const grossProfitCents = baseReceived - (order.metrics?.productionCostCents ?? 0) - estimatedTaxCents;
+            const orderDetailUrl = `https://www.mercadolivre.com.br/vendas/${encodeURIComponent(
+              order.marketplace_order_id
+            )}/detalhe`;
 
             return (
               <Pressable
@@ -5895,6 +6715,14 @@ function MarketplaceOrdersDashboardSection({
 	                        onPress={() => onRecalculateSingleOrderSnapshot(order.id)}
 	                        disabled={isBusy}
 	                      />
+                      <AppButton
+                        label="ir ao detalhe"
+                        variant="small"
+                        active
+                        onPress={() => {
+                          void Linking.openURL(orderDetailUrl);
+                        }}
+                      />
                     </View>
                     <Text style={styles.text}>Status: {order.status || "-"} {order.substatus ? `(${order.substatus})` : ""}</Text>
                     <Text style={styles.text}>
@@ -6066,6 +6894,7 @@ function MarketplacesScreen({
   onRefreshShopeeStatus,
   onSyncCatalog,
   onSyncOrders,
+  onSyncProductAds,
   onDisconnectAll,
   onDisconnectShopee,
   onSetListingIgnored,
@@ -6087,6 +6916,7 @@ function MarketplacesScreen({
   onRefreshShopeeStatus: () => void;
   onSyncCatalog: (accountId?: string) => void;
   onSyncOrders: (accountId: string | undefined, mode: MarketplaceOrdersSyncMode) => void;
+  onSyncProductAds: (accountId: string | undefined, mode: MarketplaceOrdersSyncMode) => void;
   onDisconnectAll: () => void;
   onDisconnectShopee: () => void;
   onSetListingIgnored: (listingId: string, isIgnored: boolean) => Promise<void>;
@@ -6459,6 +7289,42 @@ function MarketplacesScreen({
                     >
                       <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
                         Vendas 1 ano
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.smallButton, isBusy && styles.buttonDisabled]}
+                      onPress={() => onSyncProductAds(account.id, "incremental")}
+                      disabled={isBusy}
+                    >
+                      <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                        Ads hoje
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.smallButton, isBusy && styles.buttonDisabled]}
+                      onPress={() => onSyncProductAds(account.id, "light")}
+                      disabled={isBusy}
+                    >
+                      <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                        Ads 48h
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.smallButton, isBusy && styles.buttonDisabled]}
+                      onPress={() => onSyncProductAds(account.id, "normal")}
+                      disabled={isBusy}
+                    >
+                      <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                        Ads 60d
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.smallButton, isBusy && styles.buttonDisabled]}
+                      onPress={() => onSyncProductAds(account.id, "full")}
+                      disabled={isBusy}
+                    >
+                      <Text allowFontScaling={false} numberOfLines={1} style={styles.smallButtonText}>
+                        Ads 1 ano
                       </Text>
                     </Pressable>
                     <Pressable
@@ -7317,6 +8183,7 @@ export default function MockupApp() {
   const [salesPoints, setSalesPoints] = useState<SalesPoint[]>([]);
   const [salesStock, setSalesStock] = useState<SalesStockOverview[]>([]);
   const [consignmentBatches, setConsignmentBatches] = useState<ConsignmentBatch[]>([]);
+  const [consignmentDashboard, setConsignmentDashboard] = useState<ConsignmentDashboard | null>(null);
   const [selectedConsignmentBatchId, setSelectedConsignmentBatchId] = useState<string | null>(null);
   const [selectedConsignmentBatchDetail, setSelectedConsignmentBatchDetail] = useState<ConsignmentBatchDetail | undefined>(
     undefined
@@ -7503,6 +8370,18 @@ export default function MockupApp() {
     return detail;
   };
 
+  const fetchConsignmentDashboard = async (filters?: { dateFrom?: string; dateTo?: string; salesPointId?: string }) => {
+    const params = new URLSearchParams();
+    if (filters?.dateFrom?.trim()) params.set("date_from", filters.dateFrom.trim());
+    if (filters?.dateTo?.trim()) params.set("date_to", filters.dateTo.trim());
+    if (filters?.salesPointId?.trim()) params.set("sales_point_id", filters.salesPointId.trim());
+    const query = params.toString();
+    const row = await apiFetch<any>(`/sales/consignment/dashboard${query ? `?${query}` : ""}`);
+    const dashboard = mapConsignmentDashboardFromApi(row);
+    setConsignmentDashboard(dashboard);
+    return dashboard;
+  };
+
   const fetchSalesPointsOverview = async () => {
     const rows = await apiFetch<any[]>("/sales/points/overview");
     setSalesPointsOverview(rows.map(mapSalesPointOverviewFromApi));
@@ -7540,9 +8419,13 @@ export default function MockupApp() {
     return items;
   };
 
-  const fetchMarketplaceOrdersDashboard = async () => {
+  const fetchMarketplaceOrdersDashboard = async (filters?: { dateFrom?: string; dateTo?: string }) => {
+    const params = new URLSearchParams();
+    if (filters?.dateFrom?.trim()) params.set("date_from", filters.dateFrom.trim());
+    if (filters?.dateTo?.trim()) params.set("date_to", filters.dateTo.trim());
+    const query = params.toString();
     const dashboard = await apiFetch<MarketplaceOrdersDashboardResponse>(
-      "/integrations/mercadolivre/orders/dashboard"
+      `/integrations/mercadolivre/orders/dashboard${query ? `?${query}` : ""}`
     );
     setMarketplaceOrdersDashboard(dashboard);
     return dashboard;
@@ -7581,6 +8464,7 @@ export default function MockupApp() {
           fetchSalesPoints(),
           fetchSalesStock(),
           fetchConsignmentBatches(),
+          fetchConsignmentDashboard(),
           fetchSalesPointsOverview(),
           fetchMarketplaceStatus(),
           fetchShopeeStatus(),
@@ -7618,6 +8502,21 @@ export default function MockupApp() {
     ]).catch((error: any) => {
       setSyncError(error?.message ?? "Falha ao carregar status dos marketplaces");
     });
+  }, [screen]);
+
+  useEffect(() => {
+    if (!["logs", "marketplaces", "marketplaceOrdersDashboard"].includes(screen)) return;
+    const timer = setInterval(() => {
+      void Promise.all([
+        fetchLogs(),
+        fetchMarketplaceStatus(),
+        fetchMarketplaceOrders(),
+        fetchMarketplaceOrdersDashboard(),
+      ]).catch((error: any) => {
+        setSyncError(error?.message ?? "Falha ao atualizar dados automáticos do marketplace");
+      });
+    }, 60000);
+    return () => clearInterval(timer);
   }, [screen]);
 
   const handleStartMercadoLivreAuth = () => {
@@ -7830,6 +8729,45 @@ export default function MockupApp() {
         );
       } catch (error: any) {
         setSyncError(error?.message ?? "Falha ao sincronizar pedidos Mercado Livre");
+      } finally {
+        setIsMarketplaceBusy(false);
+      }
+    })();
+  };
+
+  const handleSyncMarketplaceProductAds = (
+    accountId: string | undefined,
+    mode: MarketplaceOrdersSyncMode = "incremental"
+  ) => {
+    void (async () => {
+      try {
+        const modeLabel =
+          mode === "incremental"
+            ? "hoje"
+            : mode === "light"
+              ? "últimas 48h"
+              : mode === "normal"
+                ? "últimos 60 dias"
+                : "último ano";
+        setIsMarketplaceBusy(true);
+        setSyncError(null);
+        setMarketplaceInfo(null);
+        const result = await apiFetch<{
+          ok?: boolean;
+          message?: string;
+          records_read: number;
+          records_upserted: number;
+          records_failed: number;
+        }>("/integrations/mercadolivre/sync/product-ads", {
+          method: "POST",
+          body: JSON.stringify({ mode, account_id: accountId ?? "" }),
+        });
+        await Promise.all([fetchMarketplaceOrdersDashboard(), fetchLogs()]);
+        setMarketplaceInfo(
+          `Sync de Product Ads (${modeLabel}) concluído. Lidos: ${result.records_read}, atualizados: ${result.records_upserted}, falhas: ${result.records_failed}.`
+        );
+      } catch (error: any) {
+        setSyncError(error?.message ?? "Falha ao sincronizar Product Ads Mercado Livre");
       } finally {
         setIsMarketplaceBusy(false);
       }
@@ -8519,6 +9457,7 @@ export default function MockupApp() {
       {screen === "salesSkus" && (
         <SalesSkusScreen
           skus={salesSkus}
+          stock={salesStock}
           onCreate={() => {
             setEditingSalesSkuId(null);
             setScreen("salesSkuForm");
@@ -8579,11 +9518,16 @@ export default function MockupApp() {
                   default_sale_price_cents: options.suggestSalePriceFromQuote
                     ? undefined
                     : sku.defaultSalePriceCents,
+                  presential_sale_price_cents: sku.presentialSalePriceCents,
+                  wholesale_consignment_price_cents: sku.wholesaleConsignmentPriceCents,
+                  wholesale_cash_price_cents: sku.wholesaleCashPriceCents,
                   production_cost_cents: options.suggestProductionCostFromQuote
                     ? undefined
                     : sku.productionCostCents,
-                  suggested_wholesale_consignment_price_cents: sku.suggestedWholesaleConsignmentPriceCents,
-                  suggested_wholesale_cash_price_cents: sku.suggestedWholesaleCashPriceCents,
+                  sync_final_sale_price_with_suggested: sku.syncFinalSalePriceWithSuggested,
+                  sync_presential_sale_price_with_suggested: sku.syncPresentialSalePriceWithSuggested,
+                  sync_wholesale_consignment_price_with_suggested: sku.syncWholesaleConsignmentPriceWithSuggested,
+                  sync_wholesale_cash_price_with_suggested: sku.syncWholesaleCashPriceWithSuggested,
                   parent_sku_id: sku.parentSkuId || "",
                   source_quote_id: sku.sourceQuoteId || "",
                   sync_with_quote_pricing: sku.syncWithQuotePricing,
@@ -8757,7 +9701,13 @@ export default function MockupApp() {
                     })),
                   }),
                 });
-                await Promise.all([fetchConsignmentBatches(), fetchSalesStock(), fetchSalesPointsOverview(), fetchLogs()]);
+                await Promise.all([
+                  fetchConsignmentBatches(),
+                  fetchConsignmentDashboard(),
+                  fetchSalesStock(),
+                  fetchSalesPointsOverview(),
+                  fetchLogs(),
+                ]);
                 if (selectedConsignmentBatchId) {
                   await fetchConsignmentBatchDetail(selectedConsignmentBatchId);
                 }
@@ -8777,7 +9727,12 @@ export default function MockupApp() {
                     notes,
                   }),
                 });
-                await Promise.all([fetchConsignmentBatches(), fetchSalesPointsOverview(), fetchLogs()]);
+                await Promise.all([
+                  fetchConsignmentBatches(),
+                  fetchConsignmentDashboard(),
+                  fetchSalesPointsOverview(),
+                  fetchLogs(),
+                ]);
                 if (selectedConsignmentBatchId) {
                   await fetchConsignmentBatchDetail(selectedConsignmentBatchId);
                 }
@@ -8797,7 +9752,13 @@ export default function MockupApp() {
                     notes,
                   }),
                 });
-                await Promise.all([fetchConsignmentBatches(), fetchSalesStock(), fetchSalesPointsOverview(), fetchLogs()]);
+                await Promise.all([
+                  fetchConsignmentBatches(),
+                  fetchConsignmentDashboard(),
+                  fetchSalesStock(),
+                  fetchSalesPointsOverview(),
+                  fetchLogs(),
+                ]);
                 if (selectedConsignmentBatchId) {
                   await fetchConsignmentBatchDetail(selectedConsignmentBatchId);
                 }
@@ -8813,6 +9774,96 @@ export default function MockupApp() {
       {screen === "salesPointsOverview" && (
         <SalesPointsOverviewScreen
           overview={salesPointsOverview}
+          dashboard={consignmentDashboard}
+          skus={salesSkus}
+          points={salesPoints}
+          onFetchDashboard={({ dateFrom, dateTo, salesPointId }) =>
+            fetchConsignmentDashboard({ dateFrom, dateTo, salesPointId }).then(() => undefined)
+          }
+          onCreateConsignmentBatch={({ salesPointId, dispatchedAt, notes, items }) => {
+            void (async () => {
+              try {
+                await apiFetch("/sales/consignment/batches", {
+                  method: "POST",
+                  body: JSON.stringify({
+                    sales_point_id: salesPointId,
+                    dispatched_at: dispatchedAt || "",
+                    notes,
+                    items: items.map((item) => ({
+                      sku_id: item.skuId,
+                      quantity_sent: item.quantitySent,
+                      unit_sale_price_cents: item.unitSalePriceCents,
+                    })),
+                  }),
+                });
+                await Promise.all([
+                  fetchConsignmentBatches(),
+                  fetchConsignmentDashboard(),
+                  fetchSalesStock(),
+                  fetchSalesPointsOverview(),
+                  fetchLogs(),
+                ]);
+                if (selectedConsignmentBatchId) {
+                  await fetchConsignmentBatchDetail(selectedConsignmentBatchId);
+                }
+              } catch (error: any) {
+                setSyncError(error?.message ?? "Falha ao registrar envio de estoque");
+              }
+            })();
+          }}
+          onRegisterPointSale={(salesPointId, skuId, soldQuantity, soldAt, notes) => {
+            void (async () => {
+              try {
+                await apiFetch(`/sales/consignment/points/${salesPointId}/sales`, {
+                  method: "POST",
+                  body: JSON.stringify({
+                    sku_id: skuId,
+                    sold_quantity: soldQuantity,
+                    sold_at: soldAt || "",
+                    notes,
+                  }),
+                });
+                await Promise.all([
+                  fetchConsignmentBatches(),
+                  fetchConsignmentDashboard(),
+                  fetchSalesPointsOverview(),
+                  fetchLogs(),
+                ]);
+                if (selectedConsignmentBatchId) {
+                  await fetchConsignmentBatchDetail(selectedConsignmentBatchId);
+                }
+              } catch (error: any) {
+                setSyncError(error?.message ?? "Falha ao registrar venda no ponto");
+              }
+            })();
+          }}
+          onRegisterPointReturn={(salesPointId, skuId, returnedQuantity, returnedAt, notes) => {
+            void (async () => {
+              try {
+                await apiFetch(`/sales/consignment/points/${salesPointId}/returns`, {
+                  method: "POST",
+                  body: JSON.stringify({
+                    sku_id: skuId,
+                    returned_quantity: returnedQuantity,
+                    returned_at: returnedAt || "",
+                    notes,
+                  }),
+                });
+                await Promise.all([
+                  fetchConsignmentBatches(),
+                  fetchConsignmentDashboard(),
+                  fetchSalesStock(),
+                  fetchSalesPointsOverview(),
+                  fetchLogs(),
+                ]);
+                if (selectedConsignmentBatchId) {
+                  await fetchConsignmentBatchDetail(selectedConsignmentBatchId);
+                }
+              } catch (error: any) {
+                setSyncError(error?.message ?? "Falha ao registrar retirada no ponto");
+              }
+            })();
+          }}
           onMarkContactToday={(salesPointId) => {
             void (async () => {
               try {
@@ -8854,6 +9905,7 @@ export default function MockupApp() {
 	          onRefreshShopeeStatus={handleRefreshShopeeStatus}
 	          onSyncCatalog={handleSyncMarketplaceCatalog}
 	          onSyncOrders={handleSyncMarketplaceOrders}
+	          onSyncProductAds={handleSyncMarketplaceProductAds}
           onDisconnectAll={handleDisconnectMarketplace}
           onDisconnectShopee={handleDisconnectShopee}
           onSetListingIgnored={handleSetMarketplaceListingIgnored}
@@ -8872,9 +9924,13 @@ export default function MockupApp() {
 	          <MarketplaceOrdersDashboardSection
 	            orderItems={marketplaceOrderItems}
 	            accounts={marketplaceStatus?.accounts ?? []}
+	            ordersDashboard={marketplaceOrdersDashboard}
 	            normalizationRules={marketplaceNormalizationRules}
 	            isBusy={isMarketplaceBusy}
 	            taxRatePercent={parseLocaleNumber(taxRate) || 0}
+		            onFetchOrdersDashboard={({ dateFrom, dateTo }) =>
+		              fetchMarketplaceOrdersDashboard({ dateFrom, dateTo }).then(() => undefined)
+		            }
 		            onRecalculateAllOrderSnapshots={handleRecalculateAllMarketplaceOrderSnapshots}
 		            onRecalculateSingleOrderSnapshot={handleRecalculateSingleMarketplaceOrderSnapshot}
 		            onOpenSkuLinking={handleOpenMarketplaceListingSkuConfig}
@@ -9515,6 +10571,43 @@ const styles = StyleSheet.create({
     color: "#6b768f",
     fontWeight: "700",
   },
+  productAdsChartScroll: {
+    alignItems: "flex-end",
+    gap: 10,
+    minHeight: 170,
+    paddingTop: 12,
+    paddingBottom: 4,
+  },
+  productAdsBarWrap: {
+    alignItems: "center",
+    justifyContent: "flex-end",
+    width: 58,
+    gap: 6,
+  },
+  productAdsBarValue: {
+    color: "#1c2438",
+    fontSize: 10,
+    fontWeight: "800",
+    textAlign: "center",
+  },
+  productAdsBarTrack: {
+    width: 28,
+    height: 110,
+    borderRadius: 8,
+    backgroundColor: "#eef3ff",
+    justifyContent: "flex-end",
+    overflow: "hidden",
+  },
+  productAdsBarFill: {
+    width: "100%",
+    backgroundColor: "#0f766e",
+    borderRadius: 8,
+  },
+  productAdsBarLabel: {
+    color: "#64708a",
+    fontSize: 10,
+    fontWeight: "700",
+  },
   marketplaceChartsGrid: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -9528,16 +10621,15 @@ const styles = StyleSheet.create({
     minWidth: 320,
   },
   marketplaceChartsToggleButton: {
-    width: 36,
-    minWidth: 36,
-    height: 32,
-    minHeight: 32,
-    paddingHorizontal: 0,
-    borderRadius: 8,
+    minWidth: 110,
+    height: 40,
+    minHeight: 40,
+    paddingHorizontal: 12,
+    borderRadius: 10,
   },
   marketplaceChartsToggleButtonText: {
-    fontSize: 18,
-    lineHeight: 20,
+    fontSize: 12,
+    lineHeight: 14,
   },
   marketplaceLogisticsChartWrap: {
     flexDirection: "row",
@@ -9699,6 +10791,16 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#fdba74",
   },
+  skuPriceWarningCard: {
+    borderColor: "#dc2626",
+    borderWidth: 2,
+    backgroundColor: "#fff5f5",
+  },
+  skuPriceWarningText: {
+    color: "#b42318",
+    fontSize: 13,
+    fontWeight: "800",
+  },
   marketplaceMissingSkuActions: {
     marginTop: 8,
     flexDirection: "row",
@@ -9850,6 +10952,60 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  metricGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  metricCard: {
+    flexGrow: 1,
+    flexBasis: 160,
+    backgroundColor: "#f4f7ff",
+    borderWidth: 1,
+    borderColor: "#d9e0ef",
+    borderRadius: 8,
+    padding: 10,
+  },
+  metricLabel: {
+    color: "#64708a",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  metricValue: {
+    color: "#1c2438",
+    fontSize: 22,
+    fontWeight: "800",
+    marginTop: 4,
+  },
+  filterField: {
+    flexGrow: 1,
+    flexBasis: 180,
+  },
+  dashboardMovementRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    borderTopWidth: 1,
+    borderTopColor: "#e5eaf5",
+    paddingVertical: 8,
+  },
+  dashboardMovementMainText: {
+    flex: 1,
+    minWidth: 0,
+    color: "#1c2438",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  dashboardMovementMetaText: {
+    color: "#3d4863",
+    fontSize: 12,
+    width: 86,
+  },
+  dashboardMovementPointText: {
+    color: "#3d4863",
+    fontSize: 12,
+    width: 140,
+  },
   appButtonBase: {
     borderWidth: 1,
     alignItems: "center",
@@ -9915,6 +11071,13 @@ const styles = StyleSheet.create({
   },
   secondaryButtonText: {
     ...APP_BUTTON_THEME.secondary.textInactive,
+  },
+  selectedButton: {
+    backgroundColor: "#1d4ed8",
+    borderColor: "#1d4ed8",
+  },
+  selectedButtonText: {
+    color: "#ffffff",
   },
   smallButton: {
     ...APP_BUTTON_THEME.small.inactive,

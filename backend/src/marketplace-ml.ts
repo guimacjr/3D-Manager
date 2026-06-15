@@ -1193,6 +1193,251 @@ export async function fetchMercadoLivreOrderBillingDetail(params: {
   };
 }
 
+function asMetricNumber(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value.replace(",", "."));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function pickMetricValue(source: Record<string, unknown>, keys: string[]): number {
+  for (const key of keys) {
+    const direct = asMetricNumber(source[key]);
+    if (direct !== 0) return direct;
+  }
+
+  const metrics = source.metrics;
+  if (Array.isArray(metrics)) {
+    for (const item of metrics) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const metricItem = item as Record<string, unknown>;
+      const metricName = String(
+        metricItem.name ?? metricItem.key ?? metricItem.id ?? metricItem.metric ?? metricItem.type ?? ""
+      )
+        .trim()
+        .toLowerCase();
+      if (!keys.some((key) => key.toLowerCase() === metricName)) continue;
+      const value =
+        asMetricNumber(metricItem.value) ||
+        asMetricNumber(metricItem.amount) ||
+        asMetricNumber(metricItem.total) ||
+        asMetricNumber(metricItem.count);
+      if (value !== 0) return value;
+    }
+  }
+  if (metrics && typeof metrics === "object" && !Array.isArray(metrics)) {
+    const metricObj = metrics as Record<string, unknown>;
+    for (const key of keys) {
+      const value = metricObj[key];
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const nested = value as Record<string, unknown>;
+        const nestedValue =
+          asMetricNumber(nested.value) ||
+          asMetricNumber(nested.amount) ||
+          asMetricNumber(nested.total);
+        if (nestedValue !== 0) return nestedValue;
+      }
+      const direct = asMetricNumber(value);
+      if (direct !== 0) return direct;
+    }
+  }
+
+  return 0;
+}
+
+function hasProductAdsMetricDate(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return Boolean(normalizeAdsDate(row.date ?? row.day ?? row.date_from ?? row.from ?? row.metric_date));
+}
+
+function extractProductAdsDailyRows(row: any): Array<Record<string, unknown>> {
+  if (!row || typeof row !== "object") return [];
+  if (Array.isArray(row.daily)) {
+    return row.daily.filter((item: unknown) => item && typeof item === "object" && !Array.isArray(item)) as Array<
+      Record<string, unknown>
+    >;
+  }
+  if (Array.isArray(row.metrics) && row.metrics.some(hasProductAdsMetricDate)) {
+    return row.metrics.filter((item: unknown) => item && typeof item === "object" && !Array.isArray(item)) as Array<
+      Record<string, unknown>
+    >;
+  }
+  return [row as Record<string, unknown>];
+}
+
+function normalizeAdsDate(value: unknown): string | null {
+  const raw = String(value ?? "").trim();
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : null;
+}
+
+export type MercadoLivreProductAdsAdvertiser = {
+  advertiserId: string;
+  siteId?: string;
+  raw: unknown;
+};
+
+export type MercadoLivreProductAdsMetric = {
+  date: string;
+  cost: number;
+  impressions: number;
+  clicks: number;
+  orders: number;
+  revenue: number;
+};
+
+export async function fetchMercadoLivreProductAdsAdvertisers(params: {
+  accessToken: string;
+  siteId?: string | null;
+}): Promise<MercadoLivreProductAdsAdvertiser[]> {
+  const urls = [] as URL[];
+  const globalUrl = new URL(`${ML_API_BASE_URL}/advertising/advertisers`);
+  globalUrl.searchParams.set("product_id", "PADS");
+  urls.push(globalUrl);
+
+  if (params.siteId) {
+    const siteUrl = new URL(`${ML_API_BASE_URL}/marketplace/advertising/${encodeURIComponent(params.siteId)}/advertisers`);
+    siteUrl.searchParams.set("product_id", "PADS");
+    urls.push(siteUrl);
+  }
+
+  for (const url of urls) {
+    const response = await mercadoLivreFetch(url.toString(), {
+      headers: {
+        authorization: `Bearer ${params.accessToken}`,
+        accept: "application/json",
+        "Api-Version": "1",
+      },
+    });
+    const parsed = await parseApiResponse(response);
+    if (!response.ok) {
+      if ([401, 403, 404].includes(response.status)) continue;
+      throw new MercadoLivreApiError("Mercado Livre Product Ads advertisers fetch failed", response.status, parsed);
+    }
+
+    const list = Array.isArray((parsed as any)?.advertisers)
+      ? (parsed as any).advertisers
+      : Array.isArray((parsed as any)?.results)
+        ? (parsed as any).results
+        : Array.isArray(parsed)
+          ? parsed
+          : [];
+
+    const advertisers = list
+      .map((item: any) => {
+        const advertiserId = item?.advertiser_id ?? item?.id ?? item?.advertiserId;
+        if (advertiserId === undefined || advertiserId === null) return null;
+        return {
+          advertiserId: String(advertiserId),
+          siteId: item?.site_id ? String(item.site_id) : params.siteId ?? undefined,
+          raw: item,
+        } satisfies MercadoLivreProductAdsAdvertiser;
+      })
+      .filter(Boolean) as MercadoLivreProductAdsAdvertiser[];
+
+    if (advertisers.length > 0) return advertisers;
+  }
+
+  return [];
+}
+
+export async function fetchMercadoLivreProductAdsMetrics(params: {
+  accessToken: string;
+  siteId: string;
+  advertiserId: string;
+  dateFrom: string;
+  dateTo: string;
+}): Promise<{ metrics: MercadoLivreProductAdsMetric[]; raw: unknown[] }> {
+  const metrics = new Map<string, MercadoLivreProductAdsMetric>();
+  const rawRows: unknown[] = [];
+  let offset = 0;
+  const limit = 50;
+  let total = Number.MAX_SAFE_INTEGER;
+
+  while (offset < total && offset < 1000) {
+    const url = new URL(
+      `${ML_API_BASE_URL}/marketplace/advertising/${encodeURIComponent(params.siteId)}/advertisers/${encodeURIComponent(
+        params.advertiserId
+      )}/product_ads/ads/search`
+    );
+    url.searchParams.set("date_from", params.dateFrom);
+    url.searchParams.set("date_to", params.dateTo);
+    url.searchParams.set("aggregation_type", "daily");
+    url.searchParams.set("limit", String(limit));
+    url.searchParams.set("offset", String(offset));
+    url.searchParams.set("metrics", "cost,prints,impressions,clicks,orders,units_quantity,direct_amount,total_amount");
+
+    const response = await mercadoLivreFetch(url.toString(), {
+      headers: {
+        authorization: `Bearer ${params.accessToken}`,
+        accept: "application/json",
+        "Api-Version": "2",
+      },
+    });
+    const parsed = await parseApiResponse(response);
+    if (!response.ok) {
+      if ([401, 403, 404].includes(response.status)) return { metrics: [], raw: rawRows };
+      throw new MercadoLivreApiError("Mercado Livre Product Ads metrics fetch failed", response.status, parsed);
+    }
+
+    const rows = Array.isArray((parsed as any)?.results)
+      ? (parsed as any).results
+      : Array.isArray((parsed as any)?.ads)
+        ? (parsed as any).ads
+        : Array.isArray(parsed)
+          ? parsed
+          : [];
+    total = Number((parsed as any)?.paging?.total ?? rows.length + offset);
+    rawRows.push(...rows);
+
+    for (const row of rows) {
+      const dailyRows = extractProductAdsDailyRows(row);
+      for (const metricRow of dailyRows) {
+        if (!metricRow || typeof metricRow !== "object") continue;
+        const source = metricRow as Record<string, unknown>;
+        const date =
+          normalizeAdsDate(
+            source.date ??
+              source.day ??
+              source.date_from ??
+              source.from ??
+              source.metric_date ??
+              row?.date ??
+              row?.day ??
+              row?.date_from ??
+              row?.from ??
+              row?.metric_date
+          ) ?? params.dateFrom;
+        const current = metrics.get(date) ?? {
+          date,
+          cost: 0,
+          impressions: 0,
+          clicks: 0,
+          orders: 0,
+          revenue: 0,
+        };
+        current.cost += pickMetricValue(source, ["cost", "spent", "amount_spent", "consumed_budget", "investment"]);
+        current.impressions += pickMetricValue(source, ["prints", "impressions"]);
+        current.clicks += pickMetricValue(source, ["clicks"]);
+        current.orders += pickMetricValue(source, ["orders", "sales", "conversions", "units_quantity"]);
+        current.revenue += pickMetricValue(source, ["direct_amount", "total_amount", "revenue", "sales_amount"]);
+        metrics.set(date, current);
+      }
+    }
+
+    if (rows.length < limit) break;
+    offset += rows.length;
+  }
+
+  return {
+    metrics: Array.from(metrics.values()).sort((a, b) => a.date.localeCompare(b.date)),
+    raw: rawRows,
+  };
+}
+
 export function computeTokenExpiresAtIso(expiresInSeconds: number): string {
   const safeSeconds = Number.isFinite(expiresInSeconds) ? Math.max(0, Math.round(expiresInSeconds)) : 0;
   return new Date(Date.now() + safeSeconds * 1000).toISOString();

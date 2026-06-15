@@ -181,6 +181,20 @@ export function normalizeMercadoLivreRoute(url: string): string {
     if (parts[0] === "shipments" && parts[1]) return "/shipments/{shipment}";
     if (parts[0] === "v1" && parts[1] === "payments" && parts[2]) return "/v1/payments/{payment}";
     if (parts[0] === "billing") return "/billing/integration/group/ML/order/details";
+    if (parts[0] === "advertising" && parts[1] === "advertisers") return "/advertising/advertisers";
+    if (
+      parts[0] === "marketplace" &&
+      parts[1] === "advertising" &&
+      parts[3] === "advertisers" &&
+      parts[5] === "product_ads" &&
+      parts[6] === "ads" &&
+      parts[7] === "search"
+    ) {
+      return "/marketplace/advertising/{site}/advertisers/{advertiser}/product_ads/ads/search";
+    }
+    if (parts[0] === "marketplace" && parts[1] === "advertising" && parts[3] === "advertisers") {
+      return "/marketplace/advertising/{site}/advertisers";
+    }
     if (parts[0] === "oauth" && parts[1] === "token") return "/oauth/token";
     if (parts[0] === "users" && parts[1] === "me") return "/users/me";
 
